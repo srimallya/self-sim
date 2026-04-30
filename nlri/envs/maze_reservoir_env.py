@@ -93,6 +93,7 @@ class MazeReservoirEnv:
         self.agents: List[AgentState] = []
         self.food_positions: Dict[Tuple[int, int], int] = {}
         self.last_info: Dict[str, object] = {}
+        self.overlay_stats = []
         if render_mode == "human":
             from nlri.viz.pygame_viewer import PygameViewer
 
@@ -358,6 +359,8 @@ class MazeReservoirEnv:
                     "food_eaten": agent.food_eaten,
                     "collision_count": agent.collision_count,
                     "wait_count": agent.wait_count,
+                    "movement_cost": agent.movement_cost,
+                    "last_action": agent.last_action,
                 }
                 for agent in self.agents
             ],

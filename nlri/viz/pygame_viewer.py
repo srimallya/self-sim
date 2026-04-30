@@ -16,6 +16,7 @@ class PygameViewer:
         self.screen = pygame.display.set_mode((SCREEN_SIZE, SCREEN_SIZE))
         pygame.display.set_caption("self-sim NLRI")
         self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("couriernew", 13)
 
     def render(self):
         for event in pygame.event.get():
@@ -49,6 +50,7 @@ class PygameViewer:
             )
             self._draw_arrow(pygame.Color(agent.color), start_pos, end_pos)
 
+        self._draw_overlay()
         pygame.display.flip()
         self.clock.tick(self.fps)
 
@@ -88,3 +90,32 @@ class PygameViewer:
                 max(0, min(255, int(base_color.b * energy))),
             )
             pygame.draw.line(self.screen, color, center, (end_x, end_y), 1)
+
+    def _draw_overlay(self):
+        overlay_stats = getattr(self.env, "overlay_stats", None)
+        if not overlay_stats:
+            return
+
+        box_height = 18 + 18 * len(overlay_stats)
+        surface = pygame.Surface((430, box_height), pygame.SRCALPHA)
+        surface.fill((0, 0, 0, 150))
+        self.screen.blit(surface, (6, 6))
+
+        step = getattr(self.env, "step_count", 0)
+        title = self.font.render(f"step {step}", True, (220, 220, 220))
+        self.screen.blit(title, (12, 10))
+
+        for idx, stats in enumerate(overlay_stats):
+            leakage = stats.get("leakage", 0.0)
+            compute_budget = stats.get("compute_budget", 0.0)
+            action = stats.get("selected_action", -1)
+            fallback_used = "Y" if stats.get("fallback_used") else "N"
+            loss = stats.get("loss")
+            loss_text = "--" if loss is None else f"{loss:.2f}"
+            energy = stats.get("energy", 0.0)
+            line = (
+                f"A{idx} E:{energy:6.1f} L:{leakage:0.03f} "
+                f"B:{compute_budget:0.02f} Act:{action:02d} FB:{fallback_used} Loss:{loss_text}"
+            )
+            text = self.font.render(line, True, pygame.Color(stats.get("color", "white")))
+            self.screen.blit(text, (12, 28 + 18 * idx))

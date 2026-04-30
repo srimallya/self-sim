@@ -66,28 +66,42 @@ class NLRIAgent(nn.Module):
         }
 
     @torch.no_grad()
-    def act(self, obs: Dict[str, np.ndarray], deterministic: bool = False):
+    def act(
+        self,
+        obs: Dict[str, np.ndarray],
+        deterministic: bool = False,
+        fallback_probability: float = 1.0,
+    ):
         outputs = self.forward(obs)
         logits = outputs["logits"][0]
         probs = torch.softmax(logits, dim=0)
         invalid = bool(torch.isnan(probs).any() or torch.isinf(probs).any())
+        fallback_used = False
 
         if invalid:
             action = self._fallback_action(obs)
+            fallback_used = True
         elif deterministic:
             action = int(torch.argmax(probs).item())
         else:
             distribution = torch.distributions.Categorical(probs=probs)
             action = int(distribution.sample().item())
 
-        if self.use_legacy_fallback and self._should_apply_legacy_fallback(obs, probs):
+        if (
+            self.use_legacy_fallback
+            and np.random.random() < fallback_probability
+            and self._should_apply_legacy_fallback(obs, probs)
+        ):
             action = self._fallback_action(obs)
+            fallback_used = True
 
         self.last_debug = {
             "z": outputs["z"][0].detach().cpu().numpy(),
             "compute_budget": outputs["compute_budget"][0].detach().cpu().numpy(),
             "action_probs": probs.detach().cpu().numpy(),
             "uncertainty": outputs["uncertainty"][0].detach().cpu().numpy(),
+            "fallback_used": fallback_used,
+            "selected_action": action,
         }
         return action, self.last_debug
 
@@ -108,9 +122,9 @@ class NLRIAgent(nn.Module):
         obs_t: Dict[str, torch.Tensor] = {}
         for key, value in obs.items():
             arr = np.asarray(value, dtype=np.float32)
-            if arr.ndim == 1:
-                arr = arr[None, :]
-            elif arr.ndim == 2:
+            if key in {"perception_cone", "shared_signal"} and arr.ndim == 2:
                 arr = arr[None, :, :]
+            elif key not in {"perception_cone", "shared_signal"} and arr.ndim == 1:
+                arr = arr[None, :]
             obs_t[key] = torch.from_numpy(arr).to(self.device)
         return obs_t

@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 
 def compute_nlri_loss(
+    pred_next_belief: torch.Tensor,
     pred_obs_embedding: torch.Tensor,
     target_obs_embedding: torch.Tensor,
     reservoir_next_pred: torch.Tensor,
@@ -12,6 +13,7 @@ def compute_nlri_loss(
     reservoir_star_pred: torch.Tensor,
     reservoir_star_target: torch.Tensor,
     leakage_pred: torch.Tensor,
+    leakage_target: torch.Tensor,
     policy_logits: torch.Tensor,
     actions: torch.Tensor,
     uncertainty: torch.Tensor,
@@ -24,9 +26,13 @@ def compute_nlri_loss(
     eta_uncertainty: float = 0.01,
     xi_latent: float = 0.001,
 ) -> Dict[str, torch.Tensor]:
-    world_prediction_loss = F.mse_loss(pred_obs_embedding, target_obs_embedding)
-    reservoir_loss = F.mse_loss(reservoir_next_pred, reservoir_next_target) + F.mse_loss(
-        reservoir_star_pred, reservoir_star_target
+    world_prediction_loss = F.mse_loss(pred_next_belief, target_obs_embedding) + F.mse_loss(
+        pred_obs_embedding, target_obs_embedding
+    )
+    reservoir_loss = (
+        F.mse_loss(reservoir_next_pred, reservoir_next_target)
+        + F.mse_loss(reservoir_star_pred, reservoir_star_target)
+        + F.mse_loss(leakage_pred, leakage_target)
     )
     # Placeholder actor-critic replacement for the first pass: supervised CE on sampled actions.
     policy_loss = F.cross_entropy(policy_logits, actions)

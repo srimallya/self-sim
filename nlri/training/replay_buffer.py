@@ -9,35 +9,8 @@ class ReplayBuffer:
         self.capacity = capacity
         self.buffer: Deque[Dict[str, Any]] = deque(maxlen=capacity)
 
-    def push(
-        self,
-        obs,
-        action,
-        next_obs,
-        reservoir,
-        next_reservoir,
-        reservoir_star,
-        leakage,
-        movement_cost,
-        collision,
-        done,
-        info,
-    ):
-        self.buffer.append(
-            {
-                "obs": obs,
-                "action": action,
-                "next_obs": next_obs,
-                "reservoir": reservoir,
-                "next_reservoir": next_reservoir,
-                "reservoir_star": reservoir_star,
-                "leakage": leakage,
-                "movement_cost": movement_cost,
-                "collision": collision,
-                "done": done,
-                "info": info,
-            }
-        )
+    def push(self, **transition):
+        self.buffer.append(dict(transition))
 
     def sample(self, batch_size: int) -> List[Dict[str, Any]]:
         return random.sample(list(self.buffer), min(batch_size, len(self.buffer)))
