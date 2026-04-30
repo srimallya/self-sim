@@ -149,3 +149,13 @@ Run the new NLRI realtime pygame simulation with:
 ```bash
 python -m nlri.experiments.run_nlri_pygame
 ```
+
+## One-button NLRI training
+
+Launch the realtime pygame simulator and train the NLRI stack online with:
+
+```bash
+python3 play_train_nlri.py
+```
+
+This keeps the same live maze window, food dots, moving agents, heading arrows, and realtime stepping while collecting replay, training online, printing metrics every 100 steps, and writing checkpoints to `checkpoints/nlri/latest.pt`.
