@@ -156,6 +156,7 @@ class MazeReservoirEnv:
 
             energy_cost, collision = self._apply_action(agent, action)
             reward = -energy_cost
+            ate_food = False
 
             cell = tuple(agent.pos.tolist())
             if cell in self.food_positions:
@@ -163,6 +164,7 @@ class MazeReservoirEnv:
                 del self.food_positions[cell]
                 agent.food_eaten += 1
                 reward += ENERGY_GAIN_FOOD
+                ate_food = True
 
             agent.energy = max(0.0, agent.energy - energy_cost)
             reward += 0.2 * (agent.energy - prev_energy)
@@ -176,7 +178,7 @@ class MazeReservoirEnv:
                 agent.wait_count += 1
 
             agent.reservoir_next = self._compute_reservoir(agent)
-            agent.reservoir_star = self._compute_reservoir_star(agent, observation, collision)
+            agent.reservoir_star = self._compute_reservoir_star(agent, observation, collision, ate_food)
             agent.leakage = self._compute_leakage(agent.reservoir_next, agent.reservoir_star)
 
             rewards.append(float(reward))
@@ -317,17 +319,32 @@ class MazeReservoirEnv:
             "attention_budget": float(attention_budget),
         }
 
-    def _compute_reservoir_star(self, agent: AgentState, observation: Dict[str, np.ndarray], collision: bool):
+    def _compute_reservoir_star(
+        self,
+        agent: AgentState,
+        observation: Dict[str, np.ndarray],
+        collision: bool,
+        ate_food: bool,
+    ):
         # This is intentionally heuristic in v1. Later it should become learned.
-        visible_food_value = float(np.clip(observation["perception_cone"][observation["perception_cone"] > 0].sum() / 500.0, 0.0, 1.0))
-        reachable_food_value = float(np.clip(observation["raw_energy_gradient"].max() / 300.0, 0.0, 1.0))
+        observed_visible = float(
+            np.clip(observation["perception_cone"][observation["perception_cone"] > 0].sum() / 500.0, 0.0, 1.0)
+        )
+        observed_reachable = float(np.clip(observation["raw_energy_gradient"].max() / 300.0, 0.0, 1.0))
+        next_visible = float(agent.reservoir_next["visible_food_value"])
+        next_reachable = float(agent.reservoir_next["reachable_food_value"])
+        visible_food_value = next_visible if ate_food else max(next_visible, observed_visible * 0.7)
+        reachable_food_value = next_reachable if ate_food else max(next_reachable, observed_reachable * 0.7)
+        expected_self_energy = float(np.clip(agent.energy / MAX_ENERGY, 0.0, 1.0))
+        if not collision:
+            expected_self_energy = max(expected_self_energy, float(np.clip((agent.energy - 0.25) / MAX_ENERGY, 0.0, 1.0)))
         return {
-            "self_energy": float(np.clip((agent.energy - ENERGY_LOSS_STATIONARY) / MAX_ENERGY, 0.0, 1.0)),
+            "self_energy": expected_self_energy,
             "visible_food_value": visible_food_value,
             "reachable_food_value": reachable_food_value,
-            "collision_safety": 1.0 if not collision else 0.75,
+            "collision_safety": max(agent.reservoir_next["collision_safety"], 0.9 if not collision else 0.7),
             "time_budget": float(max(0.0, 1.0 - (self.step_count / float(self.max_steps)))),
-            "attention_budget": 1.0,
+            "attention_budget": max(agent.reservoir_next["attention_budget"], 0.8),
         }
 
     def _compute_leakage(self, reservoir_next: Dict[str, float], reservoir_star: Dict[str, float]):

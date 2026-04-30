@@ -46,19 +46,27 @@ def main():
                 "mean_leakage": summary["mean_leakage"],
                 "collision_count": summary["total_collision_count"],
                 "fallback_rate": summary["mean_fallback_rate"],
+                "useful_transition_score": summary.get("mean_useful_transition_score", 0.0),
+                "world_loss_ema": summary.get("world_loss_ema", 0.0),
+                "compute_budget": summary.get("mean_compute_budget", 0.0),
+                "z_std": summary.get("latent_diagnostics", {}).get("z_variance", 0.0) ** 0.5,
                 "action_entropy": summary["mean_action_entropy"],
+                "checkpoint_step": summary.get("checkpoint_step", 0),
             }
         )
 
     print(
-        f"{'ablation':<22} {'energy':>10} {'food':>8} {'leakage':>10} "
-        f"{'collisions':>12} {'fallback':>10} {'entropy':>10}"
+        f"{'ablation':<22} {'energy':>9} {'food':>6} {'leakage':>9} "
+        f"{'util':>8} {'world_ema':>10} {'budget':>8} {'z_std':>8} "
+        f"{'collisions':>11} {'fallback':>9} {'entropy':>9} {'ckpt':>6}"
     )
     for row in rows:
         print(
-            f"{row['ablation']:<22} {row['mean_energy']:>10.2f} {row['food_eaten']:>8d} "
-            f"{row['mean_leakage']:>10.3f} {row['collision_count']:>12d} "
-            f"{row['fallback_rate']:>10.2f} {row['action_entropy']:>10.3f}"
+            f"{row['ablation']:<22} {row['mean_energy']:>9.2f} {row['food_eaten']:>6d} "
+            f"{row['mean_leakage']:>9.3f} {row['useful_transition_score']:>8.2f} "
+            f"{row['world_loss_ema']:>10.2f} {row['compute_budget']:>8.3f} "
+            f"{row['z_std']:>8.3f} {row['collision_count']:>11d} "
+            f"{row['fallback_rate']:>9.2f} {row['action_entropy']:>9.3f} {row['checkpoint_step']:>6d}"
         )
 
 

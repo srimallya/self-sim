@@ -1,6 +1,7 @@
 from .losses import compute_nlri_loss
 from .latent_diagnostics import LatentDiagnosticsCollector
 from .metrics import RunningMetrics
+from .normalizer import MultiNormalizer
 from .online_trainer import OnlineNLRITrainer
 from .replay_buffer import ReplayBuffer
 
@@ -8,6 +9,7 @@ __all__ = [
     "ReplayBuffer",
     "compute_nlri_loss",
     "LatentDiagnosticsCollector",
+    "MultiNormalizer",
     "RunningMetrics",
     "OnlineNLRITrainer",
 ]

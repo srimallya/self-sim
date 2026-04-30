@@ -28,6 +28,8 @@ class NLRIAgent(nn.Module):
         self.z_dim = z_dim
         self.use_legacy_fallback = use_legacy_fallback
         self.ablation_mode = ablation_mode
+        self.compute_floor = 0.0
+        self.obs_normalizer = None
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
         self.encoder = NLRIEncoder(latent_dim=belief_dim)
@@ -56,7 +58,7 @@ class NLRIAgent(nn.Module):
             z = torch.zeros(next_belief.shape[0], self.z_dim, device=self.device)
             compute_budget = torch.full((next_belief.shape[0], 1), 0.5, device=self.device)
         else:
-            z, compute_budget = self.latent_router(next_belief)
+            z, compute_budget = self.latent_router(next_belief, compute_floor=self.compute_floor)
 
         reservoir_next, reservoir_star, leakage = self.reservoir_model(next_belief)
         logits = self.policy(next_belief, z, compute_budget)
@@ -102,14 +104,14 @@ class NLRIAgent(nn.Module):
             distribution = torch.distributions.Categorical(probs=probs)
             action = int(distribution.sample().item())
 
+        fallback_action = self._fallback_action(obs)
         if (
             self.ablation_mode not in {"random-policy", "legacy-fallback-only"}
             and self.use_legacy_fallback
             and not force_no_fallback
             and np.random.random() < fallback_probability
-            and self._should_apply_legacy_fallback(obs, probs)
         ):
-            action = self._fallback_action(obs)
+            action = fallback_action
             fallback_used = True
 
         self.last_debug = {
@@ -119,6 +121,7 @@ class NLRIAgent(nn.Module):
             "uncertainty": outputs["uncertainty"][0].detach().cpu().numpy(),
             "fallback_used": fallback_used,
             "selected_action": action,
+            "fallback_action": fallback_action,
         }
         return action, self.last_debug
 
@@ -137,7 +140,8 @@ class NLRIAgent(nn.Module):
 
     def _tensorize_obs(self, obs: Dict[str, np.ndarray]):
         obs_t: Dict[str, torch.Tensor] = {}
-        for key, value in obs.items():
+        source_obs = self.obs_normalizer.normalize_obs(obs) if self.obs_normalizer is not None else obs
+        for key, value in source_obs.items():
             arr = np.asarray(value, dtype=np.float32)
             if key in {"perception_cone", "shared_signal"} and arr.ndim == 2:
                 arr = arr[None, :, :]

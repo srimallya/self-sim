@@ -18,7 +18,8 @@ class LatentRouter(nn.Module):
             nn.Sigmoid(),
         )
 
-    def forward(self, belief: torch.Tensor):
+    def forward(self, belief: torch.Tensor, compute_floor: float = 0.0):
         z = self.z_head(belief)
-        compute_budget = self.compute_budget_head(belief)
+        raw_compute_budget = self.compute_budget_head(belief)
+        compute_budget = compute_floor + (1.0 - compute_floor) * raw_compute_budget
         return z, compute_budget

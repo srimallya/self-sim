@@ -37,11 +37,14 @@ CSV_COLUMNS = [
     "action_entropy",
     "fallback_rate",
     "world_loss",
+    "world_loss_ema",
     "reservoir_loss",
     "policy_loss",
+    "useful_transition_score",
     "total_loss",
     "ablation",
     "eval_mode",
+    "warnings",
 ]
 
 
@@ -61,13 +64,31 @@ def build_parser():
     parser.add_argument("--buffer-capacity", type=int, default=20000)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--fallback-prob", type=float, default=1.0)
-    parser.add_argument("--fallback-decay", type=float, default=0.0)
-    parser.add_argument("--min-fallback-prob", type=float, default=0.0)
+    parser.add_argument("--fallback-decay", type=float, default=0.0002)
+    parser.add_argument("--min-fallback-prob", type=float, default=0.25)
     parser.add_argument("--force-no-fallback", action="store_true")
     parser.add_argument("--ablation", choices=sorted(ABLATIONS), default="full")
     parser.add_argument("--run-dir", type=str, default="")
     parser.add_argument("--checkpoint-path", type=str, default="")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--loss-ema-beta", type=float, default=0.98)
+    parser.add_argument("--bc-weight", type=float, default=1.0)
+    parser.add_argument("--bc-decay", type=float, default=0.0005)
+    parser.add_argument("--min-bc-weight", type=float, default=0.05)
+    parser.add_argument("--compute-floor", type=float, default=0.05)
+    parser.add_argument("--compute-cost-weight", type=float, default=0.01)
+    parser.add_argument("--compute-uncertainty-weight", type=float, default=0.05)
+    parser.add_argument("--compute-leakage-weight", type=float, default=0.05)
+    parser.add_argument("--world-loss-weight", type=float, default=0.2)
+    parser.add_argument("--reservoir-loss-weight", type=float, default=1.0)
+    parser.add_argument("--policy-loss-weight", type=float, default=0.5)
+    parser.add_argument("--latent-loss-weight", type=float, default=0.01)
+    parser.add_argument("--compute-loss-weight", type=float, default=0.05)
+    parser.add_argument("--utility-aux-weight", type=float, default=0.1)
+    parser.add_argument("--entropy-weight", type=float, default=0.01)
+    parser.add_argument("--entropy-decay", type=float, default=0.0001)
+    parser.add_argument("--min-entropy-weight", type=float, default=0.001)
     return parser
 
 
@@ -92,12 +113,11 @@ def fallback_probability(step: int, args):
     if args.ablation == "legacy-fallback-only":
         return 1.0
     if step < args.warmup_steps:
-        return max(args.fallback_prob, args.min_fallback_prob)
-
+        return 1.0
     decay_steps = max(0, step - args.warmup_steps)
     fallback_prob = max(args.min_fallback_prob, args.fallback_prob - args.fallback_decay * decay_steps)
     if args.disable_fallback_after > 0 and step >= args.disable_fallback_after:
-        fallback_prob = min(fallback_prob, args.min_fallback_prob)
+        fallback_prob = max(0.05, args.min_fallback_prob * 0.5) if not args.eval else 0.0
     return max(0.0, min(1.0, fallback_prob))
 
 
@@ -105,6 +125,7 @@ def build_agents(observations, args):
     agents = [NLRIAgent(use_legacy_fallback=True, ablation_mode=args.ablation) for _ in observations]
     for agent in agents:
         agent.reset_state()
+        agent.compute_floor = args.compute_floor
         if args.eval:
             agent.eval()
         else:
@@ -151,12 +172,31 @@ def run_session(args):
             "disable_fallback_after": args.disable_fallback_after,
             "eval_mode": args.eval,
             "ablation": args.ablation,
-            "policy_weight": 0.1,
+            "grad_clip": args.grad_clip,
+            "loss_ema_beta": args.loss_ema_beta,
+            "bc_weight": args.bc_weight,
+            "bc_decay": args.bc_decay,
+            "min_bc_weight": args.min_bc_weight,
+            "compute_floor": args.compute_floor,
+            "compute_cost_weight": args.compute_cost_weight,
+            "compute_uncertainty_weight": args.compute_uncertainty_weight,
+            "compute_leakage_weight": args.compute_leakage_weight,
+            "world_loss_weight": args.world_loss_weight,
+            "reservoir_loss_weight": args.reservoir_loss_weight,
+            "policy_loss_weight": args.policy_loss_weight,
+            "latent_loss_weight": args.latent_loss_weight,
+            "compute_loss_weight": args.compute_loss_weight,
+            "utility_aux_weight": args.utility_aux_weight,
+            "entropy_weight": args.entropy_weight,
+            "entropy_decay": args.entropy_decay,
+            "min_entropy_weight": args.min_entropy_weight,
+            "min_fallback_prob": args.min_fallback_prob,
         },
     )
     latent_collector = LatentDiagnosticsCollector()
     metrics_rows = []
     last_saved_checkpoint = ""
+    checkpoint_step = 0
 
     loaded_checkpoint = None
     checkpoint_source = args.checkpoint_path or args.checkpoint_dir
@@ -260,6 +300,7 @@ def run_session(args):
             if not args.eval and step % args.checkpoint_every == 0:
                 saved = trainer.save_checkpoint(args.checkpoint_dir, step, periodic=True)
                 last_saved_checkpoint = saved[0]
+                checkpoint_step = step
 
             if terminated or truncated:
                 observations, _info = env.reset(seed=args.seed + step)
@@ -276,13 +317,20 @@ def run_session(args):
         if not args.eval:
             saved = trainer.save_checkpoint(args.checkpoint_dir, step, periodic=False)
             last_saved_checkpoint = saved[0]
+            checkpoint_step = step
     finally:
         env.close()
 
     write_metrics_csv(metrics_path, metrics_rows)
     latent_collector.save(latent_path)
     latent_summary = latent_collector.summary()
-    final_summary = build_final_summary(trainer.metrics(), latent_summary, last_saved_checkpoint, loaded_checkpoint)
+    final_summary = build_final_summary(
+        trainer.metrics(),
+        latent_summary,
+        last_saved_checkpoint,
+        loaded_checkpoint,
+        checkpoint_step,
+    )
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(final_summary, handle, indent=2, sort_keys=True)
     if not args.quiet:
@@ -318,31 +366,36 @@ def snapshot_metrics_rows(step, trainer_metrics, args):
                 "action_entropy": float(metrics_row["action_entropy"]),
                 "fallback_rate": float(metrics_row["fallback_used_rate"]),
                 "world_loss": metrics_row.get("world_prediction_loss"),
+                "world_loss_ema": metrics_row.get("world_loss_ema"),
                 "reservoir_loss": metrics_row.get("reservoir_loss"),
                 "policy_loss": metrics_row.get("policy_loss"),
+                "useful_transition_score": float(metrics_row["useful_transition_score"]),
                 "total_loss": metrics_row.get("loss"),
                 "ablation": args.ablation,
                 "eval_mode": bool(args.eval),
+                "warnings": "|".join(metrics_row.get("warning_flags", [])),
             }
         )
     return rows
 
 
 def format_agent_metrics(row):
+    warning_suffix = f" warn={row['warnings']}" if row["warnings"] else ""
     return (
         f"step={row['step']} agent={row['agent_id']} energy={row['energy']:.1f} "
         f"food={row['food_eaten']} leakage={row['leakage']:.3f} "
         f"budget={row['compute_budget']:.3f} z_mean={row['z_mean']:.3f} "
         f"z_std={row['z_std']:.3f} entropy={row['action_entropy']:.3f} "
-        f"fallback_rate={row['fallback_rate']:.2f} "
+        f"fallback_rate={row['fallback_rate']:.2f} util={row['useful_transition_score']:.2f} "
         f"world_loss={fmt_loss(row['world_loss'])} "
+        f"world_ema={fmt_loss(row['world_loss_ema'])} "
         f"reservoir_loss={fmt_loss(row['reservoir_loss'])} "
         f"policy_loss={fmt_loss(row['policy_loss'])} "
-        f"total_loss={fmt_loss(row['total_loss'])}"
+        f"total_loss={fmt_loss(row['total_loss'])}{warning_suffix}"
     )
 
 
-def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded_checkpoint):
+def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded_checkpoint, checkpoint_step):
     per_agent = trainer_metrics["per_agent"]
     mean_energy = safe_mean([row["energy_sum"] / max(1, row["energy_count"]) for row in per_agent])
     total_food_eaten = int(sum(row["food_eaten"] for row in per_agent))
@@ -351,7 +404,9 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
     mean_compute_budget = safe_mean([row["compute_budget_sum"] / max(1, row["energy_count"]) for row in per_agent])
     mean_fallback_rate = safe_mean([row["fallback_sum"] / max(1, row["energy_count"]) for row in per_agent])
     mean_action_entropy = safe_mean([row["entropy_sum"] / max(1, row["energy_count"]) for row in per_agent])
+    mean_useful_transition_score = safe_mean([row["useful_transition_sum"] / max(1, row["energy_count"]) for row in per_agent])
     losses = [row.get("loss") for row in per_agent if row.get("loss") is not None]
+    world_loss_emas = [row.get("world_loss_ema") for row in per_agent if row.get("world_loss_ema") is not None]
     return {
         "mean_energy": mean_energy,
         "total_food_eaten": total_food_eaten,
@@ -360,9 +415,12 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
         "mean_compute_budget": mean_compute_budget,
         "mean_fallback_rate": mean_fallback_rate,
         "mean_action_entropy": mean_action_entropy,
+        "mean_useful_transition_score": mean_useful_transition_score,
         "final_total_loss": safe_mean(losses),
+        "world_loss_ema": safe_mean(world_loss_emas),
         "checkpoint_path": checkpoint_path or "",
         "loaded_checkpoint": loaded_checkpoint or "",
+        "checkpoint_step": int(checkpoint_step),
         "latent_diagnostics": latent_summary,
     }
 
@@ -374,7 +432,7 @@ def write_metrics_csv(path, rows):
         writer.writeheader()
         for row in rows:
             serialized = dict(row)
-            for loss_key in ("world_loss", "reservoir_loss", "policy_loss", "total_loss"):
+            for loss_key in ("world_loss", "world_loss_ema", "reservoir_loss", "policy_loss", "total_loss"):
                 serialized[loss_key] = "" if serialized[loss_key] is None else f"{serialized[loss_key]:.6f}"
             writer.writerow(serialized)
 
