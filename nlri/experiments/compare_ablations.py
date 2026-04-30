@@ -50,6 +50,10 @@ def main():
                 "world_loss_ema": summary.get("world_loss_ema", 0.0),
                 "compute_budget": summary.get("mean_compute_budget", 0.0),
                 "z_std": summary.get("latent_diagnostics", {}).get("z_variance", 0.0) ** 0.5,
+                "value_loss": summary.get("value_loss", 0.0),
+                "action_histogram_max_fraction": summary.get("mean_action_histogram_max_fraction", 0.0),
+                "position_novelty": summary.get("mean_position_novelty", 0.0),
+                "steps_since_food": summary.get("max_steps_since_food", 0),
                 "action_entropy": summary["mean_action_entropy"],
                 "checkpoint_step": summary.get("checkpoint_step", 0),
             }
@@ -57,15 +61,18 @@ def main():
 
     print(
         f"{'ablation':<22} {'energy':>9} {'food':>6} {'leakage':>9} "
-        f"{'util':>8} {'world_ema':>10} {'budget':>8} {'z_std':>8} "
-        f"{'collisions':>11} {'fallback':>9} {'entropy':>9} {'ckpt':>6}"
+        f"{'util':>8} {'world_ema':>10} {'value':>8} {'budget':>8} {'z_std':>8} "
+        f"{'hist':>7} {'novelty':>8} {'no_food':>8} {'collisions':>11} "
+        f"{'fallback':>9} {'entropy':>9} {'ckpt':>6}"
     )
     for row in rows:
         print(
             f"{row['ablation']:<22} {row['mean_energy']:>9.2f} {row['food_eaten']:>6d} "
             f"{row['mean_leakage']:>9.3f} {row['useful_transition_score']:>8.2f} "
-            f"{row['world_loss_ema']:>10.2f} {row['compute_budget']:>8.3f} "
-            f"{row['z_std']:>8.3f} {row['collision_count']:>11d} "
+            f"{row['world_loss_ema']:>10.2f} {row['value_loss']:>8.2f} "
+            f"{row['compute_budget']:>8.3f} {row['z_std']:>8.3f} "
+            f"{row['action_histogram_max_fraction']:>7.2f} {row['position_novelty']:>8.2f} "
+            f"{row['steps_since_food']:>8d} {row['collision_count']:>11d} "
             f"{row['fallback_rate']:>9.2f} {row['action_entropy']:>9.3f} {row['checkpoint_step']:>6d}"
         )
 

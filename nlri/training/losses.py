@@ -19,6 +19,11 @@ def compute_nlri_loss(
     fallback_actions: torch.Tensor,
     bc_mask: torch.Tensor,
     utility_scores: torch.Tensor,
+    value_pred: torch.Tensor,
+    value_target: torch.Tensor,
+    imagined_actions: torch.Tensor,
+    imagined_mask: torch.Tensor,
+    action_histogram: torch.Tensor,
     uncertainty: torch.Tensor,
     z: torch.Tensor,
     compute_budget: torch.Tensor,
@@ -28,6 +33,11 @@ def compute_nlri_loss(
     beta: float = 0.1,
     bc_weight: float = 1.0,
     entropy_weight: float = 0.01,
+    value_loss_weight: float = 0.5,
+    entropy_target: float = 1.0,
+    entropy_target_weight: float = 0.05,
+    action_diversity_weight: float = 0.02,
+    imagined_weight: float = 0.2,
     lambda_op: float = 0.01,
     mu_search: float = 0.01,
     eta_uncertainty: float = 0.01,
@@ -38,6 +48,9 @@ def compute_nlri_loss(
     compute_cost_weight: float = 0.01,
     compute_uncertainty_weight: float = 0.05,
     compute_leakage_weight: float = 0.05,
+    compute_target_weight: float = 0.05,
+    compute_target_floor: float = 0.05,
+    compute_target_ceil: float = 0.8,
 ) -> Dict[str, torch.Tensor]:
     world_prediction_loss = F.smooth_l1_loss(pred_next_belief, target_obs_embedding) + F.smooth_l1_loss(
         pred_obs_embedding, target_obs_embedding
@@ -47,21 +60,39 @@ def compute_nlri_loss(
         + F.smooth_l1_loss(reservoir_star_pred, reservoir_star_target)
         + F.smooth_l1_loss(leakage_pred, leakage_target)
     )
-    policy_loss = F.cross_entropy(policy_logits, actions)
+    value_target = value_target.detach()
+    value_pred_flat = value_pred.squeeze(1)
+    value_loss = F.smooth_l1_loss(value_pred_flat, value_target)
     bc_ce = F.cross_entropy(policy_logits, fallback_actions, reduction="none")
     bc_loss = (bc_ce * bc_mask).sum() / torch.clamp(bc_mask.sum(), min=1.0)
     probs = torch.softmax(policy_logits, dim=1)
     log_probs = torch.log_softmax(policy_logits, dim=1)
     entropy_bonus = -(probs * log_probs).sum(dim=1).mean()
     chosen_log_probs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    advantage = (value_target - value_pred_flat).detach()
+    advantage = (advantage - advantage.mean()) / torch.clamp(advantage.std(unbiased=False), min=1e-3)
+    policy_loss = -(chosen_log_probs * advantage).mean()
     utility_scores = torch.clamp(utility_scores, -5.0, 5.0)
     utility_aux_loss = -(chosen_log_probs * utility_scores.detach()).mean()
+    entropy_gap = torch.relu(torch.as_tensor(entropy_target, device=policy_logits.device) - entropy_bonus)
+    entropy_target_loss = entropy_gap.pow(2)
+    uniform = torch.full_like(probs, 1.0 / probs.shape[1])
+    uniform_kl_loss = (probs * (torch.log(torch.clamp(probs, min=1e-8)) - torch.log(uniform))).sum(dim=1).mean()
+    histogram = torch.clamp(action_histogram.to(policy_logits.device), min=1e-6)
+    histogram = histogram / histogram.sum()
+    action_diversity_loss = torch.sum(histogram * torch.log(histogram * histogram.numel()))
+    imagined_ce = F.cross_entropy(policy_logits, imagined_actions, reduction="none")
+    imagined_policy_loss = (imagined_ce * imagined_mask).sum() / torch.clamp(imagined_mask.sum(), min=1.0)
     operating_cost = compute_budget.mean()
     search_cost = leakage_pred.mean()
     uncertainty_loss = uncertainty.mean()
     latent_regularization = z.pow(2).mean()
     detached_uncertainty = uncertainty.detach().squeeze(1)
     detached_leakage = leakage_target.detach().mean(dim=1)
+    entropy_gap_detached = torch.relu(torch.as_tensor(entropy_target, device=policy_logits.device) - (-(probs.detach() * torch.log(torch.clamp(probs.detach(), min=1e-8))).sum(dim=1)))
+    raw_compute_target = 0.35 * detached_uncertainty + 0.45 * detached_leakage + 0.20 * entropy_gap_detached
+    compute_target = torch.clamp(raw_compute_target, min=compute_target_floor, max=compute_target_ceil)
+    compute_target_loss = F.smooth_l1_loss(compute_budget.squeeze(1), compute_target)
     compute_variance_penalty = torch.relu(0.02 - compute_budget.std(unbiased=False))
     compute_loss = (
         compute_cost_weight * compute_budget.mean()
@@ -76,11 +107,16 @@ def compute_nlri_loss(
         + beta * policy_loss
         + bc_weight * bc_loss
         - entropy_weight * entropy_bonus
+        + value_loss_weight * value_loss
+        + entropy_target_weight * (entropy_target_loss + 0.25 * uniform_kl_loss)
+        + action_diversity_weight * action_diversity_loss
+        + imagined_weight * imagined_policy_loss
         + lambda_op * operating_cost
         + mu_search * search_cost
         + eta_uncertainty * uncertainty_loss
         + latent_loss_weight * xi_latent * latent_regularization
         + compute_loss_weight * compute_loss
+        + compute_target_weight * compute_target_loss
         + utility_aux_weight * utility_aux_loss
     )
     return {
@@ -88,12 +124,21 @@ def compute_nlri_loss(
         "world_prediction_loss": world_prediction_loss,
         "reservoir_loss": reservoir_loss,
         "policy_loss": policy_loss,
+        "value_loss": value_loss,
+        "value_mean": value_pred_flat.mean(),
+        "advantage_mean": advantage.mean(),
         "bc_loss": bc_loss,
         "entropy_bonus": entropy_bonus,
+        "entropy_target_loss": entropy_target_loss,
+        "uniform_kl_loss": uniform_kl_loss,
+        "action_diversity_loss": action_diversity_loss,
+        "imagined_policy_loss": imagined_policy_loss,
         "operating_cost": operating_cost,
         "search_cost": search_cost,
         "uncertainty_loss": uncertainty_loss,
         "latent_regularization": latent_regularization,
         "compute_loss": compute_loss,
+        "compute_target_loss": compute_target_loss,
+        "compute_target": compute_target.mean(),
         "utility_aux_loss": utility_aux_loss,
     }

@@ -1,7 +1,7 @@
 from .encoder import NLRIEncoder
 from .latent_router import LatentRouter
 from .nlri_agent import NLRIAgent
-from .policy import PolicyHead
+from .policy import PolicyHead, ValueHead
 from .reservoir_model import ReservoirModel
 from .world_model import WorldModel
 
@@ -10,6 +10,7 @@ __all__ = [
     "LatentRouter",
     "NLRIAgent",
     "PolicyHead",
+    "ValueHead",
     "ReservoirModel",
     "WorldModel",
 ]

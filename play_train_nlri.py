@@ -40,6 +40,15 @@ CSV_COLUMNS = [
     "world_loss_ema",
     "reservoir_loss",
     "policy_loss",
+    "value_loss",
+    "value_mean",
+    "advantage_mean",
+    "entropy_target_loss",
+    "action_diversity_loss",
+    "action_histogram_max_fraction",
+    "position_novelty",
+    "steps_since_food",
+    "compute_target",
     "useful_transition_score",
     "total_loss",
     "ablation",
@@ -88,7 +97,21 @@ def build_parser():
     parser.add_argument("--utility-aux-weight", type=float, default=0.1)
     parser.add_argument("--entropy-weight", type=float, default=0.01)
     parser.add_argument("--entropy-decay", type=float, default=0.0001)
-    parser.add_argument("--min-entropy-weight", type=float, default=0.001)
+    parser.add_argument("--min-entropy-weight", type=float, default=0.005)
+    parser.add_argument("--value-loss-weight", type=float, default=0.5)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--entropy-target", type=float, default=1.0)
+    parser.add_argument("--entropy-target-weight", type=float, default=0.08)
+    parser.add_argument("--action-diversity-weight", type=float, default=0.04)
+    parser.add_argument("--policy-temperature", type=float, default=1.15)
+    parser.add_argument("--eval-temperature", type=float, default=0.5)
+    parser.add_argument("--deterministic-eval", action="store_true")
+    parser.add_argument("--imagined-candidates", type=int, default=4)
+    parser.add_argument("--imagined-horizon", type=int, default=3)
+    parser.add_argument("--imagined-weight", type=float, default=0.2)
+    parser.add_argument("--compute-target-weight", type=float, default=0.05)
+    parser.add_argument("--compute-target-floor", type=float, default=0.05)
+    parser.add_argument("--compute-target-ceil", type=float, default=0.8)
     return parser
 
 
@@ -191,6 +214,17 @@ def run_session(args):
             "entropy_decay": args.entropy_decay,
             "min_entropy_weight": args.min_entropy_weight,
             "min_fallback_prob": args.min_fallback_prob,
+            "value_loss_weight": args.value_loss_weight,
+            "gamma": args.gamma,
+            "entropy_target": args.entropy_target,
+            "entropy_target_weight": args.entropy_target_weight,
+            "action_diversity_weight": args.action_diversity_weight,
+            "imagined_candidates": args.imagined_candidates,
+            "imagined_horizon": args.imagined_horizon,
+            "imagined_weight": args.imagined_weight,
+            "compute_target_weight": args.compute_target_weight,
+            "compute_target_floor": args.compute_target_floor,
+            "compute_target_ceil": args.compute_target_ceil,
         },
     )
     latent_collector = LatentDiagnosticsCollector()
@@ -203,6 +237,8 @@ def run_session(args):
     if args.resume:
         loaded_checkpoint = trainer.load_checkpoint(checkpoint_source)
         trainer.reset_live_tracking()
+        if loaded_checkpoint:
+            checkpoint_step = int(getattr(trainer, "env_step", 0))
         if not args.quiet:
             print(
                 f"resume={'loaded' if loaded_checkpoint else 'not-found'} "
@@ -228,9 +264,10 @@ def run_session(args):
             for agent, obs in zip(agents, current_obs):
                 action, debug = agent.act(
                     obs,
-                    deterministic=args.eval,
+                    deterministic=args.eval and args.deterministic_eval,
                     fallback_probability=fallback_prob,
                     force_no_fallback=args.force_no_fallback and args.ablation != "legacy-fallback-only",
+                    temperature=args.eval_temperature if args.eval else args.policy_temperature,
                 )
                 actions.append(action)
                 debug_rows.append(debug)
@@ -369,6 +406,15 @@ def snapshot_metrics_rows(step, trainer_metrics, args):
                 "world_loss_ema": metrics_row.get("world_loss_ema"),
                 "reservoir_loss": metrics_row.get("reservoir_loss"),
                 "policy_loss": metrics_row.get("policy_loss"),
+                "value_loss": metrics_row.get("value_loss"),
+                "value_mean": metrics_row.get("value_mean"),
+                "advantage_mean": metrics_row.get("advantage_mean"),
+                "entropy_target_loss": metrics_row.get("entropy_target_loss"),
+                "action_diversity_loss": metrics_row.get("action_diversity_loss"),
+                "action_histogram_max_fraction": float(metrics_row["action_histogram_max_fraction"]),
+                "position_novelty": float(metrics_row["position_novelty"]),
+                "steps_since_food": int(metrics_row["steps_since_food"]),
+                "compute_target": float(metrics_row.get("compute_target") or 0.0),
                 "useful_transition_score": float(metrics_row["useful_transition_score"]),
                 "total_loss": metrics_row.get("loss"),
                 "ablation": args.ablation,
@@ -391,6 +437,10 @@ def format_agent_metrics(row):
         f"world_ema={fmt_loss(row['world_loss_ema'])} "
         f"reservoir_loss={fmt_loss(row['reservoir_loss'])} "
         f"policy_loss={fmt_loss(row['policy_loss'])} "
+        f"value_loss={fmt_loss(row['value_loss'])} "
+        f"hist_max={row['action_histogram_max_fraction']:.2f} "
+        f"novelty={row['position_novelty']:.2f} "
+        f"no_food={row['steps_since_food']} "
         f"total_loss={fmt_loss(row['total_loss'])}{warning_suffix}"
     )
 
@@ -405,7 +455,11 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
     mean_fallback_rate = safe_mean([row["fallback_sum"] / max(1, row["energy_count"]) for row in per_agent])
     mean_action_entropy = safe_mean([row["entropy_sum"] / max(1, row["energy_count"]) for row in per_agent])
     mean_useful_transition_score = safe_mean([row["useful_transition_sum"] / max(1, row["energy_count"]) for row in per_agent])
+    mean_hist_max = safe_mean([row["action_histogram_max_fraction"] for row in per_agent])
+    mean_position_novelty = safe_mean([row["position_novelty"] for row in per_agent])
+    max_steps_since_food = int(max([row["steps_since_food"] for row in per_agent] or [0]))
     losses = [row.get("loss") for row in per_agent if row.get("loss") is not None]
+    value_losses = [row.get("value_loss") for row in per_agent if row.get("value_loss") is not None]
     world_loss_emas = [row.get("world_loss_ema") for row in per_agent if row.get("world_loss_ema") is not None]
     return {
         "mean_energy": mean_energy,
@@ -416,7 +470,11 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
         "mean_fallback_rate": mean_fallback_rate,
         "mean_action_entropy": mean_action_entropy,
         "mean_useful_transition_score": mean_useful_transition_score,
+        "mean_action_histogram_max_fraction": mean_hist_max,
+        "mean_position_novelty": mean_position_novelty,
+        "max_steps_since_food": max_steps_since_food,
         "final_total_loss": safe_mean(losses),
+        "value_loss": safe_mean(value_losses),
         "world_loss_ema": safe_mean(world_loss_emas),
         "checkpoint_path": checkpoint_path or "",
         "loaded_checkpoint": loaded_checkpoint or "",
@@ -432,7 +490,18 @@ def write_metrics_csv(path, rows):
         writer.writeheader()
         for row in rows:
             serialized = dict(row)
-            for loss_key in ("world_loss", "world_loss_ema", "reservoir_loss", "policy_loss", "total_loss"):
+            for loss_key in (
+                "world_loss",
+                "world_loss_ema",
+                "reservoir_loss",
+                "policy_loss",
+                "value_loss",
+                "value_mean",
+                "advantage_mean",
+                "entropy_target_loss",
+                "action_diversity_loss",
+                "total_loss",
+            ):
                 serialized[loss_key] = "" if serialized[loss_key] is None else f"{serialized[loss_key]:.6f}"
             writer.writerow(serialized)
 

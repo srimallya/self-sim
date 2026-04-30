@@ -35,9 +35,15 @@ class OnlineNLRITrainer:
                 "reservoir_loss": None,
                 "policy_loss": None,
                 "bc_loss": None,
+                "value_loss": None,
+                "value_mean": None,
+                "advantage_mean": None,
                 "compute_loss": None,
                 "utility_aux_loss": None,
                 "entropy_bonus": None,
+                "entropy_target_loss": None,
+                "action_diversity_loss": None,
+                "compute_target": None,
                 "loss": None,
                 "nonfinite_update_skipped": False,
             }
@@ -48,6 +54,11 @@ class OnlineNLRITrainer:
         self.leakage_windows = [deque(maxlen=100) for _ in agents]
         self.movement_cost_windows = [deque(maxlen=100) for _ in agents]
         self.utility_windows = [deque(maxlen=100) for _ in agents]
+        self.learned_action_windows = [deque(maxlen=100) for _ in agents]
+        self.position_windows = [deque(maxlen=100) for _ in agents]
+        self.last_action_seen = [None for _ in agents]
+        self.repeated_action_counts = [0 for _ in agents]
+        self.steps_since_food = [0 for _ in agents]
         self.prev_episode_counters = [
             {"food_eaten": 0, "collision_count": 0, "wait_count": 0}
             for _ in agents
@@ -99,6 +110,18 @@ class OnlineNLRITrainer:
         self.leakage_windows[agent_id].append(leakage_mean)
         self.movement_cost_windows[agent_id].append(float(movement_cost))
         self.utility_windows[agent_id].append(float(useful_transition_score))
+        position = tuple(agent_info.get("position", ()))
+        if position:
+            self.position_windows[agent_id].append(position)
+        learned_action = not bool(debug.get("fallback_used", False))
+        if learned_action:
+            self.learned_action_windows[agent_id].append(int(action))
+        if self.last_action_seen[agent_id] == int(action):
+            self.repeated_action_counts[agent_id] += 1
+        else:
+            self.repeated_action_counts[agent_id] = 1
+            self.last_action_seen[agent_id] = int(action)
+        self.steps_since_food[agent_id] = 0 if food_delta > 0 else self.steps_since_food[agent_id] + 1
 
         self.replay_buffer.push(
             agent_id=agent_id,
@@ -117,6 +140,7 @@ class OnlineNLRITrainer:
             fallback_used=bool(debug.get("fallback_used", False)),
             fallback_action=int(debug.get("fallback_action", action)),
             useful_transition_score=float(useful_transition_score),
+            learned_action=learned_action,
         )
 
         live = self.live_stats[agent_id]
@@ -136,6 +160,10 @@ class OnlineNLRITrainer:
         live["fallback_used"] = bool(debug.get("fallback_used", False))
         live["uncertainty"] = float(np.asarray(debug.get("uncertainty", [0.0])).reshape(-1)[0])
         live["useful_transition_score"] = float(np.mean(self.utility_windows[agent_id]))
+        live["action_histogram_max_fraction"] = self._histogram_max_fraction(self.learned_action_windows[agent_id])
+        live["position_novelty"] = self._position_novelty(self.position_windows[agent_id])
+        live["steps_since_food"] = int(self.steps_since_food[agent_id])
+        live["repeated_same_action_count"] = int(self.repeated_action_counts[agent_id])
 
         live["energy_sum"] += live["energy"]
         live["energy_count"] += 1
@@ -194,8 +222,8 @@ class OnlineNLRITrainer:
                 self._mark_skip(agent_id)
                 continue
 
-            obs_t = agent._tensorize_obs(normalized_obs_batch)
-            next_obs_t = agent._tensorize_obs(normalized_next_obs_batch)
+            obs_t = agent._tensorize_obs(normalized_obs_batch, normalize=False)
+            next_obs_t = agent._tensorize_obs(normalized_next_obs_batch, normalize=False)
             encoded = agent.encoder(obs_t)
             target_next_embedding = agent.encoder(next_obs_t).detach()
             self.normalizer.update("world_target", target_next_embedding.detach().cpu().numpy())
@@ -214,6 +242,19 @@ class OnlineNLRITrainer:
                 )
             reservoir_next_pred, reservoir_star_pred, leakage_pred = agent.reservoir_model(pred_next_belief)
             policy_logits = agent.policy(pred_next_belief, z, compute_budget)
+            value_pred = agent.value_head(pred_next_belief, z, compute_budget)
+            with torch.no_grad():
+                next_encoded = agent.encoder(next_obs_t)
+                next_zero_belief = torch.zeros(next_encoded.shape[0], agent.belief_dim, device=agent.device)
+                next_belief, _next_obs_embedding, _next_uncertainty = agent.world_model(next_encoded, next_zero_belief)
+                if self.ablation == "no-router":
+                    next_z = torch.zeros(next_encoded.shape[0], agent.z_dim, device=agent.device)
+                    next_compute_budget = torch.full((next_encoded.shape[0], 1), 0.5, device=agent.device)
+                else:
+                    next_z, next_compute_budget = agent.latent_router(
+                        next_belief, compute_floor=float(self.config.get("compute_floor", 0.05))
+                    )
+                next_value = agent.value_head(next_belief, next_z, next_compute_budget).squeeze(1)
 
             reservoir_next_target = self._stack_reservoir(samples, "next_reservoir", agent.device)
             reservoir_star_target = self._stack_reservoir(samples, "reservoir_star", agent.device)
@@ -223,6 +264,14 @@ class OnlineNLRITrainer:
                 dtype=torch.float32,
                 device=agent.device,
             )
+            reservoir_leakage_penalty = leakage_target.mean(dim=1)
+            utility_target = torch.clamp(utility_scores - reservoir_leakage_penalty, -10.0, 10.0)
+            done_mask = torch.tensor(
+                [0.0 if sample.get("done") else 1.0 for sample in samples],
+                dtype=torch.float32,
+                device=agent.device,
+            )
+            value_target = utility_target + float(self.config.get("gamma", 0.99)) * done_mask * next_value
             self.normalizer.update("reservoir_target", reservoir_next_target.detach().cpu().numpy())
             normalized_reservoir_next_pred = self.normalizer.normalize_tensor("reservoir_target", reservoir_next_pred)
             normalized_reservoir_next_target = self.normalizer.normalize_tensor("reservoir_target", reservoir_next_target)
@@ -237,6 +286,10 @@ class OnlineNLRITrainer:
                 device=agent.device,
             )
             bc_mask = torch.ones(len(samples), dtype=torch.float32, device=agent.device)
+            imagined_actions, imagined_mask = self._imagined_actions(
+                agent_id, agent, pred_next_belief, z, compute_budget, policy_logits
+            )
+            action_histogram = self._action_histogram_tensor(agent_id, agent.device)
 
             if not self._finite_tensor(
                 [
@@ -245,6 +298,7 @@ class OnlineNLRITrainer:
                     normalized_reservoir_star_target,
                     normalized_leakage_target,
                     utility_scores,
+                    value_target,
                 ]
             ):
                 self._mark_skip(agent_id)
@@ -265,6 +319,11 @@ class OnlineNLRITrainer:
                 fallback_actions=fallback_actions,
                 bc_mask=bc_mask,
                 utility_scores=utility_scores,
+                value_pred=value_pred,
+                value_target=value_target,
+                imagined_actions=imagined_actions,
+                imagined_mask=imagined_mask,
+                action_histogram=action_histogram,
                 uncertainty=uncertainty,
                 z=z,
                 compute_budget=compute_budget,
@@ -279,6 +338,14 @@ class OnlineNLRITrainer:
                 compute_cost_weight=float(self.config.get("compute_cost_weight", 0.01)),
                 compute_uncertainty_weight=float(self.config.get("compute_uncertainty_weight", 0.05)),
                 compute_leakage_weight=float(self.config.get("compute_leakage_weight", 0.05)),
+                value_loss_weight=float(self.config.get("value_loss_weight", 0.5)),
+                entropy_target=float(self.config.get("entropy_target", 1.0)),
+                entropy_target_weight=float(self.config.get("entropy_target_weight", 0.05)),
+                action_diversity_weight=float(self.config.get("action_diversity_weight", 0.02)),
+                imagined_weight=float(self.config.get("imagined_weight", 0.2)),
+                compute_target_weight=float(self.config.get("compute_target_weight", 0.05)),
+                compute_target_floor=float(self.config.get("compute_target_floor", 0.05)),
+                compute_target_ceil=float(self.config.get("compute_target_ceil", 0.8)),
             )
 
             total_loss = losses["loss"]
@@ -360,6 +427,11 @@ class OnlineNLRITrainer:
         self.leakage_windows = [deque(maxlen=100) for _ in self.agents]
         self.movement_cost_windows = [deque(maxlen=100) for _ in self.agents]
         self.utility_windows = [deque(maxlen=100) for _ in self.agents]
+        self.learned_action_windows = [deque(maxlen=100) for _ in self.agents]
+        self.position_windows = [deque(maxlen=100) for _ in self.agents]
+        self.last_action_seen = [None for _ in self.agents]
+        self.repeated_action_counts = [0 for _ in self.agents]
+        self.steps_since_food = [0 for _ in self.agents]
         self.prev_episode_counters = [
             {"food_eaten": 0, "collision_count": 0, "wait_count": 0}
             for _ in self.agents
@@ -453,6 +525,12 @@ class OnlineNLRITrainer:
             flags.append("fb_early")
         if row.get("nonfinite_update_skipped"):
             flags.append("skip_nf")
+        if row.get("action_histogram_max_fraction", 0.0) > 0.8:
+            flags.append("action_collapse")
+        if row.get("steps_since_food", 0) >= 500:
+            flags.append("stagnation")
+        if row.get("position_novelty", 1.0) < 0.2:
+            flags.append("low_position_novelty")
         return flags
 
     def _ema(self, current, new_value):
@@ -478,6 +556,43 @@ class OnlineNLRITrainer:
     def _finite_tensor(self, tensors: List[torch.Tensor]):
         return all(torch.isfinite(tensor).all().item() for tensor in tensors)
 
+    def _imagined_actions(self, agent_id, agent, belief, z, compute_budget, policy_logits):
+        candidates = max(1, int(self.config.get("imagined_candidates", 4)))
+        if int(self.config.get("imagined_horizon", 3)) <= 0 or float(self.config.get("imagined_weight", 0.2)) <= 0:
+            return torch.zeros(policy_logits.shape[0], dtype=torch.long, device=policy_logits.device), torch.zeros(
+                policy_logits.shape[0], dtype=torch.float32, device=policy_logits.device
+            )
+        with torch.no_grad():
+            probs = torch.softmax(policy_logits, dim=1)
+            top_actions = torch.topk(probs, k=min(candidates, probs.shape[1]), dim=1).indices
+            reservoir_next, _reservoir_star, leakage = agent.reservoir_model(belief)
+            value = agent.value_head(belief, z, compute_budget).squeeze(1)
+            base_score = value - leakage.mean(dim=1) - 0.02 * compute_budget.squeeze(1)
+            histogram = self._action_histogram_tensor(agent_id, policy_logits.device)
+            diversity_bonus = 1.0 - histogram[top_actions]
+            candidate_scores = base_score.unsqueeze(1) + 0.05 * diversity_bonus
+            best_idx = torch.argmax(candidate_scores, dim=1)
+            imagined_actions = top_actions.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+        return imagined_actions, torch.ones(policy_logits.shape[0], dtype=torch.float32, device=policy_logits.device)
+
+    def _action_histogram_tensor(self, agent_id, device):
+        hist = torch.ones(21, dtype=torch.float32, device=device) * 1e-3
+        for action in self.learned_action_windows[agent_id]:
+            if 0 <= int(action) < hist.numel():
+                hist[int(action)] += 1.0
+        return hist / hist.sum()
+
+    def _histogram_max_fraction(self, actions):
+        if not actions:
+            return 0.0
+        counts = np.bincount(np.asarray(actions, dtype=np.int64), minlength=21)
+        return float(counts.max() / max(1, counts.sum()))
+
+    def _position_novelty(self, positions):
+        if not positions:
+            return 1.0
+        return float(len(set(positions)) / len(positions))
+
     def _entropy(self, probs):
         if probs is None:
             return 0.0
@@ -502,6 +617,16 @@ class OnlineNLRITrainer:
             "fallback_used": False,
             "uncertainty": 0.0,
             "useful_transition_score": 0.0,
+            "value_loss": None,
+            "value_mean": 0.0,
+            "advantage_mean": 0.0,
+            "entropy_target_loss": None,
+            "action_diversity_loss": None,
+            "action_histogram_max_fraction": 0.0,
+            "position_novelty": 1.0,
+            "steps_since_food": 0,
+            "repeated_same_action_count": 0,
+            "compute_target": 0.0,
             "energy_sum": 0.0,
             "energy_count": 0,
             "leakage_sum": 0.0,

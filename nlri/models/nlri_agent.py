@@ -7,7 +7,7 @@ from torch import nn
 from nlri.envs.maze_reservoir_env import ACTION_DIM
 from .encoder import NLRIEncoder
 from .latent_router import LatentRouter
-from .policy import PolicyHead
+from .policy import PolicyHead, ValueHead
 from .reservoir_model import ReservoirModel
 from .world_model import WorldModel
 
@@ -37,6 +37,7 @@ class NLRIAgent(nn.Module):
         self.reservoir_model = ReservoirModel(belief_dim=belief_dim)
         self.latent_router = LatentRouter(belief_dim=belief_dim, z_dim=z_dim)
         self.policy = PolicyHead(belief_dim=belief_dim, z_dim=z_dim, action_dim=action_dim)
+        self.value_head = ValueHead(belief_dim=belief_dim, z_dim=z_dim)
         self.planner = None
 
         self.register_buffer("belief", torch.zeros(1, belief_dim))
@@ -62,6 +63,7 @@ class NLRIAgent(nn.Module):
 
         reservoir_next, reservoir_star, leakage = self.reservoir_model(next_belief)
         logits = self.policy(next_belief, z, compute_budget)
+        value = self.value_head(next_belief, z, compute_budget)
         return {
             "encoded": encoded,
             "belief": next_belief,
@@ -73,6 +75,7 @@ class NLRIAgent(nn.Module):
             "reservoir_star": reservoir_star,
             "leakage": leakage,
             "logits": logits,
+            "value": value,
         }
 
     @torch.no_grad()
@@ -82,10 +85,12 @@ class NLRIAgent(nn.Module):
         deterministic: bool = False,
         fallback_probability: float = 1.0,
         force_no_fallback: bool = False,
+        temperature: float = 1.0,
     ):
         outputs = self.forward(obs)
         logits = outputs["logits"][0]
-        probs = torch.softmax(logits, dim=0)
+        temp = max(float(temperature), 1e-3)
+        probs = torch.softmax(logits / temp, dim=0)
         invalid = bool(torch.isnan(probs).any() or torch.isinf(probs).any())
         fallback_used = False
 
@@ -119,6 +124,7 @@ class NLRIAgent(nn.Module):
             "compute_budget": outputs["compute_budget"][0].detach().cpu().numpy(),
             "action_probs": probs.detach().cpu().numpy(),
             "uncertainty": outputs["uncertainty"][0].detach().cpu().numpy(),
+            "value": outputs["value"][0].detach().cpu().numpy(),
             "fallback_used": fallback_used,
             "selected_action": action,
             "fallback_action": fallback_action,
@@ -138,9 +144,9 @@ class NLRIAgent(nn.Module):
             return min(19, int(round(best_angle / 18.0)) % 20)
         return int(np.random.randint(0, self.action_dim))
 
-    def _tensorize_obs(self, obs: Dict[str, np.ndarray]):
+    def _tensorize_obs(self, obs: Dict[str, np.ndarray], normalize: bool = True):
         obs_t: Dict[str, torch.Tensor] = {}
-        source_obs = self.obs_normalizer.normalize_obs(obs) if self.obs_normalizer is not None else obs
+        source_obs = self.obs_normalizer.normalize_obs(obs) if normalize and self.obs_normalizer is not None else obs
         for key, value in source_obs.items():
             arr = np.asarray(value, dtype=np.float32)
             if key in {"perception_cone", "shared_signal"} and arr.ndim == 2:
