@@ -19,6 +19,7 @@ class NLRIAgent(nn.Module):
         belief_dim: int = 64,
         z_dim: int = 32,
         use_legacy_fallback: bool = True,
+        ablation_mode: str = "full",
         device: Optional[str] = None,
     ):
         super().__init__()
@@ -26,6 +27,7 @@ class NLRIAgent(nn.Module):
         self.belief_dim = belief_dim
         self.z_dim = z_dim
         self.use_legacy_fallback = use_legacy_fallback
+        self.ablation_mode = ablation_mode
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
         self.encoder = NLRIEncoder(latent_dim=belief_dim)
@@ -49,7 +51,13 @@ class NLRIAgent(nn.Module):
             self.reset_state(encoded.shape[0])
         next_belief, obs_embedding, uncertainty = self.world_model(encoded, self.belief)
         self.belief = next_belief.detach()
-        z, compute_budget = self.latent_router(next_belief)
+
+        if self.ablation_mode == "no-router":
+            z = torch.zeros(next_belief.shape[0], self.z_dim, device=self.device)
+            compute_budget = torch.full((next_belief.shape[0], 1), 0.5, device=self.device)
+        else:
+            z, compute_budget = self.latent_router(next_belief)
+
         reservoir_next, reservoir_star, leakage = self.reservoir_model(next_belief)
         logits = self.policy(next_belief, z, compute_budget)
         return {
@@ -71,6 +79,7 @@ class NLRIAgent(nn.Module):
         obs: Dict[str, np.ndarray],
         deterministic: bool = False,
         fallback_probability: float = 1.0,
+        force_no_fallback: bool = False,
     ):
         outputs = self.forward(obs)
         logits = outputs["logits"][0]
@@ -78,7 +87,13 @@ class NLRIAgent(nn.Module):
         invalid = bool(torch.isnan(probs).any() or torch.isinf(probs).any())
         fallback_used = False
 
-        if invalid:
+        if self.ablation_mode == "legacy-fallback-only":
+            action = self._fallback_action(obs)
+            fallback_used = True
+        elif self.ablation_mode == "random-policy":
+            action = int(np.random.randint(0, self.action_dim))
+            probs = torch.full_like(probs, 1.0 / probs.numel())
+        elif invalid:
             action = self._fallback_action(obs)
             fallback_used = True
         elif deterministic:
@@ -88,7 +103,9 @@ class NLRIAgent(nn.Module):
             action = int(distribution.sample().item())
 
         if (
-            self.use_legacy_fallback
+            self.ablation_mode not in {"random-policy", "legacy-fallback-only"}
+            and self.use_legacy_fallback
+            and not force_no_fallback
             and np.random.random() < fallback_probability
             and self._should_apply_legacy_fallback(obs, probs)
         ):

@@ -19,6 +19,8 @@ def compute_nlri_loss(
     uncertainty: torch.Tensor,
     z: torch.Tensor,
     compute_budget: torch.Tensor,
+    world_weight: float = 1.0,
+    reservoir_weight: float = 1.0,
     alpha: float = 1.0,
     beta: float = 0.1,
     lambda_op: float = 0.01,
@@ -34,7 +36,6 @@ def compute_nlri_loss(
         + F.mse_loss(reservoir_star_pred, reservoir_star_target)
         + F.mse_loss(leakage_pred, leakage_target)
     )
-    # Placeholder actor-critic replacement for the first pass: supervised CE on sampled actions.
     policy_loss = F.cross_entropy(policy_logits, actions)
     operating_cost = compute_budget.mean()
     search_cost = leakage_pred.mean()
@@ -42,8 +43,8 @@ def compute_nlri_loss(
     latent_regularization = z.pow(2).mean()
 
     total = (
-        world_prediction_loss
-        + alpha * reservoir_loss
+        world_weight * world_prediction_loss
+        + reservoir_weight * alpha * reservoir_loss
         + beta * policy_loss
         + lambda_op * operating_cost
         + mu_search * search_cost

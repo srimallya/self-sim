@@ -18,6 +18,8 @@ class OnlineNLRITrainer:
         self.device = agents[0].device if agents else torch.device("cpu")
         self.training_step = 0
         self.env_step = 0
+        self.eval_mode = bool(self.config.get("eval_mode", False))
+        self.ablation = self.config.get("ablation", "full")
         self.loss_history = [
             {
                 "world_prediction_loss": None,
@@ -27,26 +29,19 @@ class OnlineNLRITrainer:
             }
             for _ in agents
         ]
-        self.live_stats = [
-            {
-                "energy": 0.0,
-                "food_eaten": 0,
-                "reservoir_leakage": 0.0,
-                "compute_budget": 0.0,
-                "z_mean": 0.0,
-                "z_std": 0.0,
-                "action_entropy": 0.0,
-                "fallback_used_rate": 0.0,
-                "selected_action": 0,
-                "fallback_used": False,
-            }
+        self.live_stats = [self._make_live_stats() for _ in agents]
+        self.fallback_windows = [deque(maxlen=100) for _ in agents]
+        self.leakage_windows = [deque(maxlen=100) for _ in agents]
+        self.movement_cost_windows = [deque(maxlen=100) for _ in agents]
+        self.prev_episode_counters = [
+            {"food_eaten": 0, "collision_count": 0, "wait_count": 0}
             for _ in agents
         ]
-        self.fallback_windows = [deque(maxlen=100) for _ in agents]
         self.optimizers = [
             torch.optim.Adam(agent.parameters(), lr=self.config.get("learning_rate", 1e-3))
             for agent in agents
         ]
+        self.reset_live_tracking()
 
     def observe_transition(
         self,
@@ -78,23 +73,56 @@ class OnlineNLRITrainer:
             info=agent_info,
             fallback_used=bool(debug.get("fallback_used", False)),
         )
-        self.fallback_windows[agent_id].append(1.0 if debug.get("fallback_used", False) else 0.0)
-        self.live_stats[agent_id].update(
-            {
-                "energy": float(agent_info.get("energy", 0.0)),
-                "food_eaten": int(agent_info.get("food_eaten", 0)),
-                "reservoir_leakage": float(np.mean(leakage_values) if leakage_values else 0.0),
-                "compute_budget": float(np.asarray(debug.get("compute_budget", [0.0])).reshape(-1)[0]),
-                "z_mean": float(np.mean(debug.get("z", np.zeros(1)))),
-                "z_std": float(np.std(debug.get("z", np.zeros(1)))),
-                "action_entropy": self._entropy(debug.get("action_probs")),
-                "fallback_used_rate": float(np.mean(self.fallback_windows[agent_id])),
-                "selected_action": int(debug.get("selected_action", action)),
-                "fallback_used": bool(debug.get("fallback_used", False)),
-            }
-        )
+
+        prev = self.prev_episode_counters[agent_id]
+        food_now = int(agent_info.get("food_eaten", 0))
+        collision_now = int(agent_info.get("collision_count", 0))
+        wait_now = int(agent_info.get("wait_count", 0))
+        food_delta = food_now if food_now < prev["food_eaten"] else food_now - prev["food_eaten"]
+        collision_delta = collision_now if collision_now < prev["collision_count"] else collision_now - prev["collision_count"]
+        wait_delta = wait_now if wait_now < prev["wait_count"] else wait_now - prev["wait_count"]
+        self.prev_episode_counters[agent_id] = {
+            "food_eaten": food_now,
+            "collision_count": collision_now,
+            "wait_count": wait_now,
+        }
+
+        fallback_flag = 1.0 if debug.get("fallback_used", False) else 0.0
+        leakage_mean = float(np.mean(leakage_values) if leakage_values else 0.0)
+        action_entropy = self._entropy(debug.get("action_probs"))
+        self.fallback_windows[agent_id].append(fallback_flag)
+        self.leakage_windows[agent_id].append(leakage_mean)
+        self.movement_cost_windows[agent_id].append(float(movement_cost))
+
+        live = self.live_stats[agent_id]
+        live["energy"] = float(agent_info.get("energy", 0.0))
+        live["food_eaten"] += int(food_delta)
+        live["movement_cost"] = float(np.mean(self.movement_cost_windows[agent_id]))
+        live["collision_count"] += int(collision_delta)
+        live["wait_count"] += int(wait_delta)
+        live["leakage"] = leakage_mean
+        live["leakage_mean_100"] = float(np.mean(self.leakage_windows[agent_id]))
+        live["compute_budget"] = float(np.asarray(debug.get("compute_budget", [0.0])).reshape(-1)[0])
+        live["z_mean"] = float(np.mean(debug.get("z", np.zeros(1))))
+        live["z_std"] = float(np.std(debug.get("z", np.zeros(1))))
+        live["action_entropy"] = action_entropy
+        live["fallback_used_rate"] = float(np.mean(self.fallback_windows[agent_id]))
+        live["selected_action"] = int(debug.get("selected_action", action))
+        live["fallback_used"] = bool(debug.get("fallback_used", False))
+        live["uncertainty"] = float(np.asarray(debug.get("uncertainty", [0.0])).reshape(-1)[0])
+
+        live["energy_sum"] += live["energy"]
+        live["energy_count"] += 1
+        live["leakage_sum"] += leakage_mean
+        live["compute_budget_sum"] += live["compute_budget"]
+        live["fallback_sum"] += fallback_flag
+        live["entropy_sum"] += action_entropy
+        live["uncertainty_sum"] += live["uncertainty"]
 
     def train_step(self, batch_size: int | None = None):
+        if self.eval_mode or self.ablation in {"random-policy", "legacy-fallback-only"}:
+            return {}
+
         batch_size = batch_size or self.config.get("batch_size", 64)
         if len(self.replay_buffer) < batch_size:
             return {}
@@ -105,6 +133,10 @@ class OnlineNLRITrainer:
             grouped[int(item["agent_id"])].append(item)
 
         summaries = {}
+        world_weight = 0.0 if self.ablation == "no-world" else 1.0
+        reservoir_weight = 0.0 if self.ablation == "no-reservoir" else 1.0
+        policy_weight = float(self.config.get("policy_weight", 0.1))
+
         for agent_id, samples in grouped.items():
             agent = self.agents[agent_id]
             optimizer = self.optimizers[agent_id]
@@ -117,7 +149,11 @@ class OnlineNLRITrainer:
             target_next_embedding = agent.encoder(next_obs_t).detach()
             zero_belief = torch.zeros(encoded.shape[0], agent.belief_dim, device=agent.device)
             pred_next_belief, pred_obs_embedding, uncertainty = agent.world_model(encoded, zero_belief)
-            z, compute_budget = agent.latent_router(pred_next_belief)
+            if self.ablation == "no-router":
+                z = torch.zeros(encoded.shape[0], agent.z_dim, device=agent.device)
+                compute_budget = torch.full((encoded.shape[0], 1), 0.5, device=agent.device)
+            else:
+                z, compute_budget = agent.latent_router(pred_next_belief)
             reservoir_next_pred, reservoir_star_pred, leakage_pred = agent.reservoir_model(pred_next_belief)
             policy_logits = agent.policy(pred_next_belief, z, compute_budget)
 
@@ -141,6 +177,9 @@ class OnlineNLRITrainer:
                 uncertainty=uncertainty,
                 z=z,
                 compute_budget=compute_budget,
+                world_weight=world_weight,
+                reservoir_weight=reservoir_weight,
+                beta=policy_weight,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -162,28 +201,50 @@ class OnlineNLRITrainer:
             "training_step": self.training_step,
             "env_step": self.env_step,
             "config": self.config,
+            "loss_history": self.loss_history,
+            "live_stats": self.live_stats,
             "agents": [agent.state_dict() for agent in self.agents],
             "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
         }
         latest_path = checkpoint_dir / "latest.pt"
         torch.save(state, latest_path)
+        saved_paths = [str(latest_path)]
         if periodic:
-            torch.save(state, checkpoint_dir / f"step_{step:07d}.pt")
+            periodic_path = checkpoint_dir / f"step_{step:07d}.pt"
+            torch.save(state, periodic_path)
+            saved_paths.append(str(periodic_path))
+        return saved_paths
 
-    def load_checkpoint(self, checkpoint_dir):
-        checkpoint_dir = Path(checkpoint_dir)
-        latest_path = checkpoint_dir / "latest.pt"
-        if not latest_path.exists():
+    def load_checkpoint(self, checkpoint_path_or_dir):
+        path = Path(checkpoint_path_or_dir)
+        checkpoint_path = path / "latest.pt" if path.is_dir() else path
+        if not checkpoint_path.exists():
             return False
-        state = torch.load(latest_path, map_location=self.device)
+        state = torch.load(checkpoint_path, map_location=self.device)
         for agent, agent_state in zip(self.agents, state.get("agents", [])):
             agent.load_state_dict(agent_state)
-        for optimizer, optimizer_state in zip(self.optimizers, state.get("optimizers", [])):
-            optimizer.load_state_dict(optimizer_state)
+        optimizer_states = state.get("optimizers", [])
+        if not self.eval_mode:
+            for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
+                optimizer.load_state_dict(optimizer_state)
         self.training_step = int(state.get("training_step", 0))
         self.env_step = int(state.get("env_step", 0))
         self.config.update(state.get("config", {}))
-        return True
+        if "loss_history" in state:
+            self.loss_history = state["loss_history"]
+        if "live_stats" in state:
+            self.live_stats = state["live_stats"]
+        return str(checkpoint_path)
+
+    def reset_live_tracking(self):
+        self.live_stats = [self._make_live_stats() for _ in self.agents]
+        self.fallback_windows = [deque(maxlen=100) for _ in self.agents]
+        self.leakage_windows = [deque(maxlen=100) for _ in self.agents]
+        self.movement_cost_windows = [deque(maxlen=100) for _ in self.agents]
+        self.prev_episode_counters = [
+            {"food_eaten": 0, "collision_count": 0, "wait_count": 0}
+            for _ in self.agents
+        ]
 
     def metrics(self):
         rows = []
@@ -224,3 +285,29 @@ class OnlineNLRITrainer:
             return 0.0
         probs = np.asarray(probs, dtype=np.float32)
         return float(-(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
+
+    def _make_live_stats(self):
+        return {
+            "energy": 0.0,
+            "food_eaten": 0,
+            "movement_cost": 0.0,
+            "collision_count": 0,
+            "wait_count": 0,
+            "leakage": 0.0,
+            "leakage_mean_100": 0.0,
+            "compute_budget": 0.0,
+            "z_mean": 0.0,
+            "z_std": 0.0,
+            "action_entropy": 0.0,
+            "fallback_used_rate": 0.0,
+            "selected_action": 0,
+            "fallback_used": False,
+            "uncertainty": 0.0,
+            "energy_sum": 0.0,
+            "energy_count": 0,
+            "leakage_sum": 0.0,
+            "compute_budget_sum": 0.0,
+            "fallback_sum": 0.0,
+            "entropy_sum": 0.0,
+            "uncertainty_sum": 0.0,
+        }
