@@ -159,3 +159,15 @@ python3 play_train_nlri.py
 ```
 
 This keeps the same live maze window, food dots, moving agents, heading arrows, and realtime stepping while collecting replay, training online, printing metrics every 100 steps, and writing checkpoints to `checkpoints/nlri/latest.pt`.
+
+## Evaluating NLRI
+
+Run the saved policy in pygame evaluation mode with:
+
+```bash
+python3 play_train_nlri.py --eval --resume
+python3 play_train_nlri.py --eval --resume --force-no-fallback
+SDL_VIDEODRIVER=dummy python3 -m nlri.experiments.compare_ablations --steps 1000 --checkpoint checkpoints/nlri/latest.pt
+```
+
+Each run writes `config.json`, `metrics.csv`, `final_summary.json`, and `latent_samples.npz` under `runs/nlri/<timestamp>/`. The useful test is whether `full` beats `random-policy`, `no-router`, and `no-reservoir`, and whether it can keep functioning as fallback probability is reduced toward zero.
