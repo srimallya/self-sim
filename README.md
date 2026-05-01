@@ -160,6 +160,28 @@ python3 play_train_nlri.py
 
 This keeps the same live maze window, food dots, moving agents, heading arrows, and realtime stepping while collecting replay, training online, printing metrics every 100 steps, and writing checkpoints to `checkpoints/nlri/latest.pt`.
 
+Useful optional controls:
+
+```bash
+python3 play_train_nlri.py --resume
+python3 play_train_nlri.py --steps 12000 --warmup-steps 500 --checkpoint-every 3000
+python3 play_train_nlri.py --checkpoint-dir checkpoints/nlri_sd --self-distill-weight 1.0 --hybrid-distill-weight 0.5
+```
+
+The online trainer now includes the stabilizers added after the first runnable version:
+
+- running observation/target normalization
+- Huber world, reservoir, and value losses
+- bounded TD value targets and clipped advantages
+- gradual fallback scheduling instead of a sudden cliff
+- behavior-cloning warm start from fallback actions
+- entropy, action-diversity, and compute-budget anti-collapse pressure
+- self-distillation from feedback-conditioned teacher outputs
+- hybrid fallback-to-student distillation so the pure learned policy absorbs the successful scaffolded policy
+- transition-cleanliness prediction losses for collision risk, movement cost, and progress
+
+The fallback remains optional scaffolding, not a simulator rule change. The learned policy can be evaluated with fallback disabled.
+
 ## Evaluating NLRI
 
 Run the saved policy in pygame evaluation mode with:
@@ -171,3 +193,176 @@ SDL_VIDEODRIVER=dummy python3 -m nlri.experiments.compare_ablations --steps 1000
 ```
 
 Each run writes `config.json`, `metrics.csv`, `final_summary.json`, and `latent_samples.npz` under `runs/nlri/<timestamp>/`. The useful test is whether `full` beats `random-policy`, `no-router`, and `no-reservoir`, and whether it can keep functioning as fallback probability is reduced toward zero.
+
+Evaluation fallback semantics are explicit:
+
+- `full` defaults to learned NLRI with eval fallback probability `0.0`
+- `full-with-fallback` is a separate condition with scaffold fallback enabled
+- `full-no-fallback` forces pure learned policy
+- `legacy-fallback-only` is the old fallback behavior only
+- `random-policy` is random action selection only
+
+Long-run fixed-seed evaluation:
+
+```bash
+python3 -m nlri.experiments.eval_protocol \
+  --checkpoint checkpoints/nlri_sd/latest.pt \
+  --steps 5000 \
+  --seeds 5 \
+  --dummy-sdl
+```
+
+This writes:
+
+- `runs/nlri_eval/<timestamp>/summary.csv`
+- `runs/nlri_eval/<timestamp>/per_seed.csv`
+- `runs/nlri_eval/<timestamp>/config.json`
+
+The ranked table compares food, survival, leakage, utility, collisions, entropy, and fallback rate across:
+
+- `full`
+- `full-with-fallback`
+- `full-no-fallback`
+- `no-distill`
+- `no-router`
+- `no-reservoir`
+- `random-policy`
+- `legacy-fallback-only`
+
+## Diagnostics And Metrics
+
+Every training/eval run exports metrics that are meant to catch self-deception rather than merely prove that pygame still moves pixels.
+
+Important metrics include:
+
+- food eaten, energy, collision count, wait count, movement cost
+- reservoir leakage and useful transition score
+- action entropy and rolling action histogram concentration
+- compute budget mean and collapse warnings
+- latent `z` mean/std and latent diagnostics
+- world, reservoir, value, policy, distillation, and hybrid-distillation losses
+- fallback rate, fallback/student KL, student/teacher KL, fallback action agreement
+- transition-cleanliness metrics such as food per collision, collisions per 100 steps, movement cost per food, local loop score, wall contact rate, and position novelty
+
+Latent-router diagnostics are saved in `latent_samples.npz` and summarized in `final_summary.json`. They include `z` variance/collapse score, correlations with leakage, compute-budget correlations with uncertainty/leakage, and action entropy by latent cluster when available.
+
+## Self-Distillation And Hybrid Distillation
+
+The trainer uses two stabilizing distillation paths:
+
+1. Feedback-conditioned self-distillation: recent rollout feedback and high-quality demo windows condition a teacher path. The student learns from teacher action logits, value, compute budget, and latent `z`.
+2. Hybrid fallback-to-student distillation: when fallback helps the hybrid policy, the fallback action is converted into a soft action distribution and blended with learned logits and lightweight imagined action scores. The student learns to match this hybrid teacher while still being evaluated without fallback.
+
+Useful flags:
+
+```bash
+--self-distill-weight 1.0
+--self-distill-temperature 2.0
+--hybrid-distill-weight 0.5
+--hybrid-distill-temperature 1.5
+--hybrid-distill-decay 0.00005
+--min-hybrid-distill-weight 0.1
+--fallback-target-confidence 0.7
+--fallback-neighbor-mass 0.15
+```
+
+Checkpoint-time no-fallback probes can be enabled with:
+
+```bash
+--checkpoint-eval-steps 500 --checkpoint-eval-seeds 1
+```
+
+Those probes log no-fallback food, energy, collisions per 100 steps, and utility without making the main pygame loop headless-only.
+
+## Competitive Evolutionary Outer Loop
+
+NLRI now supports an optional evolutionary outer loop on top of the online learner. This does not replace NLRI. The inner loop still learns world, reservoir, router, policy, self-distillation, and hybrid distillation. The outer loop applies selection pressure across agent lifetimes.
+
+Enable it with:
+
+```bash
+python3 play_train_nlri.py \
+  --evolutionary-outer-loop \
+  --evolution-window 2000 \
+  --evolution-warmup-windows 1 \
+  --mutation-std 0.005 \
+  --mutation-prob 0.05
+```
+
+Every evolution window, the two agents are scored from window-local metrics. The weaker agent is replaced by a fork of the stronger agent, then small bounded mutation/diversity noise is applied. By default mutation affects policy, router, and value heads, not the world or reservoir models.
+
+Scoring modes:
+
+- `food_energy_clean`
+- `reservoir`
+- `food_only`
+- `clean_survival`
+
+Useful flags:
+
+```bash
+--evolution-score food_energy_clean
+--evolution-tie-threshold 0.05
+--fork-reset-optimizer
+--preserve-demo-memory
+--mutate-policy --mutate-router --mutate-value
+--no-mutate-world --no-mutate-reservoir
+--fork-diversity-noise 0.01
+--fork-temperature-jitter 0.1
+--fork-z-noise 0.01
+```
+
+When enabled, the run writes:
+
+```text
+runs/nlri/<timestamp>/lineage.jsonl
+```
+
+Each lineage event records the winner, loser, scores, score components, parent lineage, new lineage, generation, mutation seed, mutation parameters, and fork step. The pygame overlay also shows compact generation, lineage id, current window score, and last winner/loser.
+
+Evolution can also be enabled in the long-run eval protocol:
+
+```bash
+python3 -m nlri.experiments.eval_protocol \
+  --checkpoint checkpoints/nlri_sd/latest.pt \
+  --steps 5000 \
+  --seeds 5 \
+  --dummy-sdl \
+  --evolutionary-outer-loop \
+  --evolution-window 2000
+```
+
+Default training and default evaluation remain non-evolutionary.
+
+## Smoke Tests
+
+Useful regression checks:
+
+```bash
+python3 -m compileall play_train_nlri.py nlri
+
+SDL_VIDEODRIVER=dummy python3 play_train_nlri.py \
+  --steps 300 \
+  --warmup-steps 20 \
+  --train-every 4 \
+  --batch-size 16 \
+  --checkpoint-every 100 \
+  --checkpoint-dir /tmp/selfsim-nlri-smoke
+
+SDL_VIDEODRIVER=dummy python3 play_train_nlri.py \
+  --steps 5000 \
+  --warmup-steps 500 \
+  --train-every 4 \
+  --batch-size 32 \
+  --checkpoint-every 2500 \
+  --checkpoint-dir /tmp/selfsim-nlri-evo-test \
+  --self-distill-weight 1.0 \
+  --hybrid-distill-weight 0.5 \
+  --evolutionary-outer-loop \
+  --evolution-window 1000 \
+  --evolution-warmup-windows 1 \
+  --mutation-std 0.002 \
+  --mutation-prob 0.03
+```
+
+Do not commit generated checkpoints from `checkpoints/` or `/tmp` runs.
