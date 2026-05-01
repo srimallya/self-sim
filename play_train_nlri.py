@@ -59,9 +59,13 @@ CSV_COLUMNS = [
     "steps_since_food",
     "compute_target",
     "distill_loss",
+    "hybrid_distill_loss",
     "teacher_entropy",
     "student_entropy",
     "teacher_student_kl",
+    "fallback_student_kl",
+    "fallback_action_agreement",
+    "no_fallback_action_entropy",
     "demo_memory_size",
     "feedback_score",
     "demo_score_mean",
@@ -171,6 +175,14 @@ def build_parser():
     parser.add_argument("--demo-memory-size", type=int, default=128)
     parser.add_argument("--demo-min-score", type=float, default=0.0)
     parser.add_argument("--actor-critic-weight", type=float, default=0.1)
+    parser.add_argument("--hybrid-distill-weight", type=float, default=0.5)
+    parser.add_argument("--hybrid-distill-temperature", type=float, default=1.5)
+    parser.add_argument("--hybrid-distill-decay", type=float, default=0.00005)
+    parser.add_argument("--min-hybrid-distill-weight", type=float, default=0.1)
+    parser.add_argument("--fallback-target-confidence", type=float, default=0.7)
+    parser.add_argument("--fallback-neighbor-mass", type=float, default=0.15)
+    parser.add_argument("--checkpoint-eval-steps", type=int, default=0)
+    parser.add_argument("--checkpoint-eval-seeds", type=int, default=0)
     parser.add_argument("--collision-loss-weight", type=float, default=0.05)
     parser.add_argument("--movement-cost-loss-weight", type=float, default=0.03)
     parser.add_argument("--progress-loss-weight", type=float, default=0.03)
@@ -318,6 +330,12 @@ def run_session(args):
             "demo_memory_size": args.demo_memory_size,
             "demo_min_score": args.demo_min_score,
             "actor_critic_weight": args.actor_critic_weight,
+            "hybrid_distill_weight": args.hybrid_distill_weight,
+            "hybrid_distill_temperature": args.hybrid_distill_temperature,
+            "hybrid_distill_decay": args.hybrid_distill_decay,
+            "min_hybrid_distill_weight": args.min_hybrid_distill_weight,
+            "fallback_target_confidence": args.fallback_target_confidence,
+            "fallback_neighbor_mass": args.fallback_neighbor_mass,
             "collision_loss_weight": args.collision_loss_weight,
             "movement_cost_loss_weight": args.movement_cost_loss_weight,
             "progress_loss_weight": args.progress_loss_weight,
@@ -332,6 +350,7 @@ def run_session(args):
     metrics_rows = []
     last_saved_checkpoint = ""
     checkpoint_step = 0
+    checkpoint_eval_metrics = {}
 
     loaded_checkpoint = None
     checkpoint_source = args.checkpoint_path or args.checkpoint_dir
@@ -439,6 +458,15 @@ def run_session(args):
                 saved = trainer.save_checkpoint(args.checkpoint_dir, step, periodic=True)
                 last_saved_checkpoint = saved[0]
                 checkpoint_step = step
+                checkpoint_eval_metrics = run_checkpoint_eval(args, last_saved_checkpoint, step)
+                if checkpoint_eval_metrics and not args.quiet:
+                    print(
+                        "checkpoint_eval "
+                        f"step={step} food={checkpoint_eval_metrics['no_fallback_eval_food']:.1f} "
+                        f"energy={checkpoint_eval_metrics['no_fallback_eval_energy']:.1f} "
+                        f"coll/100={checkpoint_eval_metrics['no_fallback_eval_collisions_per_100']:.2f} "
+                        f"utility={checkpoint_eval_metrics['no_fallback_eval_utility']:.2f}"
+                    )
 
             if terminated or truncated:
                 observations, _info = env.reset(seed=args.seed + step)
@@ -469,6 +497,7 @@ def run_session(args):
         loaded_checkpoint,
         checkpoint_step,
     )
+    final_summary.update(checkpoint_eval_metrics)
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(final_summary, handle, indent=2, sort_keys=True)
     if not args.quiet:
@@ -481,6 +510,45 @@ def run_session(args):
         "latent_path": str(latent_path),
         "summary": final_summary,
         "rows": metrics_rows,
+    }
+
+
+def run_checkpoint_eval(args, checkpoint_path, step):
+    if int(args.checkpoint_eval_steps) <= 0 or int(args.checkpoint_eval_seeds) <= 0:
+        return {}
+    summaries = []
+    for offset in range(int(args.checkpoint_eval_seeds)):
+        eval_args = build_runtime_args(
+            {
+                "steps": int(args.checkpoint_eval_steps),
+                "fps": 0,
+                "seed": int(args.seed) + 10_000 + int(step) + offset,
+                "eval": True,
+                "resume": True,
+                "checkpoint_path": checkpoint_path,
+                "checkpoint_dir": args.checkpoint_dir,
+                "force_no_fallback": True,
+                "eval_fallback_prob": 0.0,
+                "fallback_prob": 0.0,
+                "min_fallback_prob": 0.0,
+                "ablation": "full",
+                "self_distill_weight": args.self_distill_weight,
+                "hybrid_distill_weight": args.hybrid_distill_weight,
+                "run_dir": str(Path(args.checkpoint_dir) / "checkpoint_eval" / f"step_{step:07d}_seed_{offset}"),
+                "quiet": True,
+                "render_mode": "none",
+                "checkpoint_eval_steps": 0,
+                "checkpoint_eval_seeds": 0,
+            }
+        )
+        summaries.append(run_session(eval_args)["summary"])
+    return {
+        "no_fallback_eval_food": safe_mean([summary.get("total_food_eaten", 0.0) for summary in summaries]),
+        "no_fallback_eval_energy": safe_mean([summary.get("mean_energy", 0.0) for summary in summaries]),
+        "no_fallback_eval_collisions_per_100": safe_mean(
+            [summary.get("mean_collisions_per_100_steps", 0.0) for summary in summaries]
+        ),
+        "no_fallback_eval_utility": safe_mean([summary.get("mean_useful_transition_score", 0.0) for summary in summaries]),
     }
 
 
@@ -526,9 +594,13 @@ def snapshot_metrics_rows(step, trainer_metrics, args):
                 "steps_since_food": int(metrics_row["steps_since_food"]),
                 "compute_target": float(metrics_row.get("compute_target") or 0.0),
                 "distill_loss": metrics_row.get("distill_loss"),
+                "hybrid_distill_loss": metrics_row.get("hybrid_distill_loss"),
                 "teacher_entropy": float(metrics_row.get("teacher_entropy") or 0.0),
                 "student_entropy": float(metrics_row.get("student_entropy") or 0.0),
                 "teacher_student_kl": float(metrics_row.get("teacher_student_kl") or 0.0),
+                "fallback_student_kl": float(metrics_row.get("fallback_student_kl") or 0.0),
+                "fallback_action_agreement": float(metrics_row.get("fallback_action_agreement") or 0.0),
+                "no_fallback_action_entropy": float(metrics_row.get("no_fallback_action_entropy") or 0.0),
                 "demo_memory_size": int(metrics_row.get("demo_memory_size") or 0),
                 "feedback_score": float(metrics_row.get("feedback_score") or 0.0),
                 "demo_score_mean": float(metrics_row.get("demo_score_mean") or 0.0),
@@ -572,6 +644,7 @@ def format_agent_metrics(row):
         f"policy_loss={fmt_loss(row['policy_loss'])} "
         f"value_loss={fmt_loss(row['value_loss'])} "
         f"distill={fmt_loss(row['distill_loss'])} "
+        f"hybrid={fmt_loss(row['hybrid_distill_loss'])} "
         f"adv_max={fmt_loss(row['advantage_max_abs'])} "
         f"hist_max={row['action_histogram_max_fraction']:.2f} "
         f"novelty={row['position_novelty']:.2f} "
@@ -604,6 +677,9 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
     losses = [row.get("loss") for row in per_agent if row.get("loss") is not None]
     value_losses = [row.get("value_loss") for row in per_agent if row.get("value_loss") is not None]
     distill_losses = [row.get("distill_loss") for row in per_agent if row.get("distill_loss") is not None]
+    hybrid_distill_losses = [row.get("hybrid_distill_loss") for row in per_agent if row.get("hybrid_distill_loss") is not None]
+    student_teacher_kls = [row.get("student_teacher_kl") for row in per_agent if row.get("student_teacher_kl") is not None]
+    fallback_student_kls = [row.get("fallback_student_kl") for row in per_agent if row.get("fallback_student_kl") is not None]
     world_loss_emas = [row.get("world_loss_ema") for row in per_agent if row.get("world_loss_ema") is not None]
     skipped_updates = int(sum(row.get("skipped_updates", 0) or 0 for row in per_agent))
     nan_recoveries = int(sum(row.get("nan_recoveries", 0) or 0 for row in per_agent))
@@ -629,6 +705,10 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
         "final_total_loss": safe_mean(losses),
         "value_loss": safe_mean(value_losses),
         "distill_loss": safe_mean(distill_losses),
+        "hybrid_distill_loss": safe_mean(hybrid_distill_losses),
+        "student_teacher_kl": safe_mean(student_teacher_kls),
+        "fallback_student_kl": safe_mean(fallback_student_kls),
+        "hybrid_distill_enabled": safe_mean(hybrid_distill_losses) > 0.0,
         "demo_memory_size": int(max([row.get("demo_memory_size", 0) for row in per_agent] or [0])),
         "demo_score_mean": safe_mean([row.get("demo_score_mean", 0.0) for row in per_agent]),
         "world_loss_ema": safe_mean(world_loss_emas),
@@ -668,9 +748,13 @@ def write_metrics_csv(path, rows):
                 "entropy_target_loss",
                 "action_diversity_loss",
                 "distill_loss",
+                "hybrid_distill_loss",
                 "teacher_entropy",
                 "student_entropy",
                 "teacher_student_kl",
+                "fallback_student_kl",
+                "fallback_action_agreement",
+                "no_fallback_action_entropy",
                 "collision_bce_loss",
                 "movement_cost_huber_loss",
                 "progress_huber_loss",

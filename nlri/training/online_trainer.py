@@ -77,6 +77,11 @@ class OnlineNLRITrainer:
                 "action_diversity_loss": None,
                 "compute_target": None,
                 "distill_loss": None,
+                "hybrid_distill_loss": None,
+                "student_teacher_kl": None,
+                "fallback_student_kl": None,
+                "fallback_action_agreement": None,
+                "no_fallback_action_entropy": None,
                 "collision_bce_loss": None,
                 "movement_cost_huber_loss": None,
                 "progress_huber_loss": None,
@@ -300,6 +305,14 @@ class OnlineNLRITrainer:
             default_decay=0.0005,
             default_min=0.05,
         )
+        hybrid_distill_weight = 0.0 if self.ablation == "no-distill" else self._scheduled_value(
+            "hybrid_distill_weight",
+            "hybrid_distill_decay",
+            "min_hybrid_distill_weight",
+            default_start=0.5,
+            default_decay=0.00005,
+            default_min=0.1,
+        )
 
         for agent_id, samples in grouped.items():
             agent = self.agents[agent_id]
@@ -438,6 +451,26 @@ class OnlineNLRITrainer:
                 agent_id, agent, pred_next_belief, z, compute_budget, policy_logits
             )
             action_histogram = self._action_histogram_tensor(agent_id, agent.device)
+            fallback_teacher_probs = self._fallback_distribution(
+                fallback_actions,
+                action_dim=policy_logits.shape[1],
+                confidence=float(self.config.get("fallback_target_confidence", 0.7)),
+                neighbor_mass=float(self.config.get("fallback_neighbor_mass", 0.15)),
+                device=agent.device,
+            )
+            fallback_used_mask = torch.tensor(
+                [1.0 if sample.get("fallback_used") else 0.0 for sample in samples],
+                dtype=torch.float32,
+                device=agent.device,
+            )
+            hybrid_teacher_probs = self._hybrid_teacher_distribution(
+                policy_logits=policy_logits,
+                fallback_teacher_probs=fallback_teacher_probs,
+                fallback_used_mask=fallback_used_mask,
+                imagined_actions=imagined_actions,
+                imagined_mask=imagined_mask,
+                temperature=float(self.config.get("hybrid_distill_temperature", 1.5)),
+            )
 
             if not self._finite_tensor(
                 [
@@ -456,6 +489,8 @@ class OnlineNLRITrainer:
                     teacher_outputs["value"],
                     teacher_outputs["z"],
                     teacher_outputs["compute_budget"],
+                    fallback_teacher_probs,
+                    hybrid_teacher_probs,
                 ]
             ):
                 self._mark_skip(agent_id)
@@ -489,6 +524,8 @@ class OnlineNLRITrainer:
                 teacher_value=teacher_outputs["value"],
                 teacher_z=teacher_outputs["z"],
                 teacher_compute_budget=teacher_outputs["compute_budget"],
+                hybrid_teacher_probs=hybrid_teacher_probs,
+                fallback_teacher_probs=fallback_teacher_probs,
                 transition_quality_pred=transition_quality_pred,
                 collision_targets=collision_targets,
                 movement_cost_targets=movement_cost_targets,
@@ -522,6 +559,8 @@ class OnlineNLRITrainer:
                 min_action_prob=float(self.config.get("min_action_prob", 1e-6)),
                 self_distill_weight=float(self.config.get("self_distill_weight", 1.0)),
                 self_distill_temperature=float(self.config.get("self_distill_temperature", 2.0)),
+                hybrid_distill_weight=hybrid_distill_weight,
+                hybrid_distill_temperature=float(self.config.get("hybrid_distill_temperature", 1.5)),
                 collision_loss_weight=float(self.config.get("collision_loss_weight", 0.2)),
                 movement_cost_loss_weight=float(self.config.get("movement_cost_loss_weight", 0.1)),
                 progress_loss_weight=float(self.config.get("progress_loss_weight", 0.1)),
@@ -896,6 +935,55 @@ class OnlineNLRITrainer:
             imagined_actions = top_actions.gather(1, best_idx.unsqueeze(1)).squeeze(1)
         return imagined_actions, torch.ones(policy_logits.shape[0], dtype=torch.float32, device=policy_logits.device)
 
+    def _fallback_distribution(self, fallback_actions, action_dim, confidence, neighbor_mass, device):
+        confidence = float(np.clip(confidence, 0.0, 0.95))
+        neighbor_mass = float(np.clip(neighbor_mass, 0.0, max(0.0, 1.0 - confidence)))
+        wait_action = action_dim - 1
+        rows = []
+        for action in fallback_actions.detach().cpu().numpy().astype(np.int64):
+            action = int(np.clip(action, 0, action_dim - 1))
+            probs = torch.zeros(action_dim, dtype=torch.float32, device=device)
+            probs[action] += confidence
+            if action != wait_action and action_dim >= 21:
+                left = (action - 1) % 20
+                right = (action + 1) % 20
+                probs[left] += neighbor_mass * 0.5
+                probs[right] += neighbor_mass * 0.5
+                remaining = max(0.0, 1.0 - confidence - neighbor_mass)
+                wait_mass = min(0.01, remaining * 0.1)
+                probs[wait_action] += wait_mass
+                angular_remaining = remaining - wait_mass
+                probs[:wait_action] += angular_remaining / max(1, wait_action)
+            else:
+                remaining = max(0.0, 1.0 - confidence)
+                probs += remaining / max(1, action_dim)
+            probs = probs / torch.clamp(probs.sum(), min=1e-8)
+            rows.append(probs)
+        return torch.stack(rows, dim=0)
+
+    def _hybrid_teacher_distribution(
+        self,
+        policy_logits,
+        fallback_teacher_probs,
+        fallback_used_mask,
+        imagined_actions,
+        imagined_mask,
+        temperature,
+    ):
+        with torch.no_grad():
+            temp = max(float(temperature), 1e-3)
+            student_probs = torch.softmax(torch.nan_to_num(policy_logits.detach(), nan=0.0).clamp(-20.0, 20.0) / temp, dim=1)
+            fallback_weight = 0.15 + 0.65 * fallback_used_mask.view(-1, 1)
+            hybrid = (1.0 - fallback_weight) * student_probs + fallback_weight * fallback_teacher_probs.detach()
+            if imagined_actions is not None and imagined_mask is not None:
+                imagined_probs = torch.full_like(hybrid, 1e-4)
+                imagined_probs.scatter_(1, imagined_actions.detach().view(-1, 1), 1.0)
+                imagined_probs = imagined_probs / torch.clamp(imagined_probs.sum(dim=1, keepdim=True), min=1e-8)
+                imagined_weight = 0.10 * imagined_mask.detach().view(-1, 1)
+                hybrid = (1.0 - imagined_weight) * hybrid + imagined_weight * imagined_probs
+            hybrid = torch.nan_to_num(hybrid, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(1e-8)
+            return hybrid / torch.clamp(hybrid.sum(dim=1, keepdim=True), min=1e-8)
+
     def _action_histogram_tensor(self, agent_id, device):
         hist = torch.ones(21, dtype=torch.float32, device=device) * 1e-3
         for action in self.learned_action_windows[agent_id]:
@@ -974,6 +1062,11 @@ class OnlineNLRITrainer:
             "repeated_same_action_count": 0,
             "compute_target": 0.0,
             "distill_loss": None,
+            "hybrid_distill_loss": None,
+            "student_teacher_kl": 0.0,
+            "fallback_student_kl": 0.0,
+            "fallback_action_agreement": 0.0,
+            "no_fallback_action_entropy": 0.0,
             "collision_bce_loss": None,
             "movement_cost_huber_loss": None,
             "progress_huber_loss": None,

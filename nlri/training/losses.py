@@ -32,6 +32,8 @@ def compute_nlri_loss(
     teacher_value: torch.Tensor | None = None,
     teacher_z: torch.Tensor | None = None,
     teacher_compute_budget: torch.Tensor | None = None,
+    hybrid_teacher_probs: torch.Tensor | None = None,
+    fallback_teacher_probs: torch.Tensor | None = None,
     transition_quality_pred: Dict[str, torch.Tensor] | None = None,
     collision_targets: torch.Tensor | None = None,
     movement_cost_targets: torch.Tensor | None = None,
@@ -70,6 +72,8 @@ def compute_nlri_loss(
     min_action_prob: float = 1e-6,
     self_distill_weight: float = 1.0,
     self_distill_temperature: float = 2.0,
+    hybrid_distill_weight: float = 0.5,
+    hybrid_distill_temperature: float = 1.5,
     collision_loss_weight: float = 0.2,
     movement_cost_loss_weight: float = 0.1,
     progress_loss_weight: float = 0.1,
@@ -164,6 +168,26 @@ def compute_nlri_loss(
             teacher_student_kl + value_distill_loss + compute_distill_loss + 0.1 * z_distill_loss,
             max=10.0,
         )
+    hybrid_distill_loss = torch.zeros((), device=policy_logits.device)
+    student_teacher_kl = torch.zeros((), device=policy_logits.device)
+    fallback_student_kl = torch.zeros((), device=policy_logits.device)
+    fallback_action_agreement = torch.zeros((), device=policy_logits.device)
+    if hybrid_teacher_probs is not None:
+        safe_teacher_probs = torch.nan_to_num(hybrid_teacher_probs.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        safe_teacher_probs = torch.clamp(safe_teacher_probs, min=min_action_prob)
+        safe_teacher_probs = safe_teacher_probs / torch.clamp(safe_teacher_probs.sum(dim=1, keepdim=True), min=1e-8)
+        hybrid_temp = max(float(hybrid_distill_temperature), 1e-3)
+        hybrid_student_log_probs = torch.log_softmax(safe_logits / hybrid_temp, dim=1)
+        student_teacher_kl = F.kl_div(hybrid_student_log_probs, safe_teacher_probs, reduction="batchmean") * (
+            hybrid_temp * hybrid_temp
+        )
+        hybrid_distill_loss = torch.clamp(student_teacher_kl, max=10.0)
+    if fallback_teacher_probs is not None:
+        safe_fallback_probs = torch.nan_to_num(fallback_teacher_probs.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        safe_fallback_probs = torch.clamp(safe_fallback_probs, min=min_action_prob)
+        safe_fallback_probs = safe_fallback_probs / torch.clamp(safe_fallback_probs.sum(dim=1, keepdim=True), min=1e-8)
+        fallback_student_kl = F.kl_div(torch.log(torch.clamp(probs, min=min_action_prob)), safe_fallback_probs, reduction="batchmean")
+        fallback_action_agreement = (torch.argmax(probs, dim=1) == torch.argmax(safe_fallback_probs, dim=1)).float().mean()
     collision_bce_loss = torch.zeros((), device=policy_logits.device)
     movement_cost_huber_loss = torch.zeros((), device=policy_logits.device)
     progress_huber_loss = torch.zeros((), device=policy_logits.device)
@@ -194,6 +218,7 @@ def compute_nlri_loss(
         + bc_weight * bc_loss
         - entropy_contribution
         + self_distill_weight * distill_loss
+        + hybrid_distill_weight * hybrid_distill_loss
         + value_loss_weight * value_loss
         + entropy_target_weight * (entropy_target_loss + 0.25 * uniform_kl_loss)
         + action_diversity_weight * action_diversity_loss
@@ -235,6 +260,11 @@ def compute_nlri_loss(
         "teacher_entropy": teacher_entropy,
         "teacher_student_kl": teacher_student_kl,
         "distill_loss": distill_loss,
+        "hybrid_distill_loss": hybrid_distill_loss,
+        "student_teacher_kl": student_teacher_kl,
+        "fallback_student_kl": fallback_student_kl,
+        "fallback_action_agreement": fallback_action_agreement,
+        "no_fallback_action_entropy": entropy_bonus,
         "value_distill_loss": value_distill_loss,
         "compute_distill_loss": compute_distill_loss,
         "z_distill_loss": z_distill_loss,

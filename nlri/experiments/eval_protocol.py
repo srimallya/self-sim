@@ -19,6 +19,7 @@ CONDITIONS = [
         "fallback_prob": 0.0,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 1.0,
+        "hybrid_distill_weight": 0.5,
     },
     {
         "name": "full-with-fallback",
@@ -28,6 +29,7 @@ CONDITIONS = [
         "fallback_prob": 0.25,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 1.0,
+        "hybrid_distill_weight": 0.5,
     },
     {
         "name": "full-no-fallback",
@@ -37,6 +39,7 @@ CONDITIONS = [
         "fallback_prob": 0.0,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 1.0,
+        "hybrid_distill_weight": 0.5,
     },
     {
         "name": "no-distill",
@@ -46,6 +49,7 @@ CONDITIONS = [
         "fallback_prob": 0.0,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 0.0,
+        "hybrid_distill_weight": 0.0,
     },
     {
         "name": "no-router",
@@ -55,6 +59,7 @@ CONDITIONS = [
         "fallback_prob": 0.0,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 1.0,
+        "hybrid_distill_weight": 0.5,
     },
     {
         "name": "no-reservoir",
@@ -64,6 +69,7 @@ CONDITIONS = [
         "fallback_prob": 0.0,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 1.0,
+        "hybrid_distill_weight": 0.5,
     },
     {
         "name": "random-policy",
@@ -73,6 +79,7 @@ CONDITIONS = [
         "fallback_prob": 0.0,
         "min_fallback_prob": 0.0,
         "self_distill_weight": 0.0,
+        "hybrid_distill_weight": 0.0,
     },
     {
         "name": "legacy-fallback-only",
@@ -82,6 +89,7 @@ CONDITIONS = [
         "fallback_prob": 1.0,
         "min_fallback_prob": 1.0,
         "self_distill_weight": 0.0,
+        "hybrid_distill_weight": 0.0,
     },
 ]
 
@@ -105,6 +113,9 @@ PER_SEED_COLUMNS = [
     "useful_score_per_100_steps",
     "local_loop_score",
     "wall_contact_rate",
+    "hybrid_distill_enabled",
+    "hybrid_distill_weight",
+    "student_teacher_kl",
     "stagnation_events",
     "survived",
     "no_nan",
@@ -131,6 +142,9 @@ SUMMARY_COLUMNS = [
     "useful_score_per_100_steps",
     "local_loop_score",
     "wall_contact_rate",
+    "hybrid_distill_enabled",
+    "hybrid_distill_weight",
+    "student_teacher_kl",
     "stagnation_events",
     "survival_rate",
     "no_nan_rate",
@@ -189,13 +203,14 @@ def main():
                     "min_fallback_prob": condition["min_fallback_prob"],
                     "ablation": condition["ablation"],
                     "self_distill_weight": condition["self_distill_weight"],
+                    "hybrid_distill_weight": condition["hybrid_distill_weight"],
                     "run_dir": str(session_run_dir),
                     "quiet": True,
                     "render_mode": "none" if args.dummy_sdl else "human",
                 }
             )
             result = run_session(session_args)
-            per_seed_rows.append(row_from_summary(condition["name"], seed, args.steps, result, args.stagnation_threshold))
+            per_seed_rows.append(row_from_summary(condition, seed, args.steps, result, args.stagnation_threshold))
 
     summary_rows = summarize(per_seed_rows, args.steps)
     write_csv(run_dir / "per_seed.csv", PER_SEED_COLUMNS, per_seed_rows)
@@ -210,7 +225,7 @@ def row_from_summary(condition, seed, steps, result, stagnation_threshold):
     stagnation_events = sum(1 for row in rows if int(row.get("steps_since_food", 0)) >= stagnation_threshold)
     no_nan = no_nan_summary(summary) and no_nan_rows(rows)
     return {
-        "condition": condition,
+        "condition": condition["name"],
         "seed": seed,
         "steps": steps,
         "final_energy": final_energy,
@@ -228,6 +243,9 @@ def row_from_summary(condition, seed, steps, result, stagnation_threshold):
         "useful_score_per_100_steps": float(summary.get("mean_useful_score_per_100_steps", 0.0)),
         "local_loop_score": float(summary.get("mean_local_loop_score", 0.0)),
         "wall_contact_rate": float(summary.get("mean_wall_contact_rate", 0.0)),
+        "hybrid_distill_enabled": bool(float(condition.get("hybrid_distill_weight", 0.0)) > 0.0),
+        "hybrid_distill_weight": float(condition.get("hybrid_distill_weight", 0.0)),
+        "student_teacher_kl": float(summary.get("student_teacher_kl", 0.0)),
         "stagnation_events": int(stagnation_events),
         "survived": bool(final_energy > 0.0),
         "no_nan": bool(no_nan),
@@ -261,6 +279,9 @@ def summarize(rows, steps):
                 "useful_score_per_100_steps": mean(items, "useful_score_per_100_steps"),
                 "local_loop_score": mean(items, "local_loop_score"),
                 "wall_contact_rate": mean(items, "wall_contact_rate"),
+                "hybrid_distill_enabled": mean_bool(items, "hybrid_distill_enabled"),
+                "hybrid_distill_weight": mean(items, "hybrid_distill_weight"),
+                "student_teacher_kl": mean(items, "student_teacher_kl"),
                 "stagnation_events": int(sum(item["stagnation_events"] for item in items)),
                 "survival_rate": mean_bool(items, "survived"),
                 "no_nan_rate": mean_bool(items, "no_nan"),
