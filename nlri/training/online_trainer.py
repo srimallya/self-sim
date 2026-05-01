@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List
@@ -9,6 +10,8 @@ import torch
 
 from .losses import compute_nlri_loss
 from .normalizer import MultiNormalizer
+from .demo_memory import DemoMemory
+from .trajectory_feedback import TrajectoryFeedbackBuilder
 
 
 class OnlineNLRITrainer:
@@ -22,8 +25,21 @@ class OnlineNLRITrainer:
         self.eval_mode = bool(self.config.get("eval_mode", False))
         self.ablation = self.config.get("ablation", "full")
         self.grad_clip = float(self.config.get("grad_clip", 1.0))
+        self.total_loss_abs_guard = float(self.config.get("total_loss_abs_guard", 1000.0))
+        self.grad_abs_guard = float(self.config.get("grad_abs_guard", 100.0))
+        self.nan_recovery_checkpoint = self.config.get("nan_recovery_checkpoint", "checkpoints/nlri/last_safe.pt")
         self.loss_ema_beta = float(self.config.get("loss_ema_beta", 0.98))
         self.normalizer = MultiNormalizer(clamp=10.0)
+        self.teacher_ema_rate = float(self.config.get("teacher_ema_rate", 0.01))
+        self.feedback_builder = TrajectoryFeedbackBuilder(window=int(self.config.get("feedback_window", 100)))
+        self.demo_memory = DemoMemory(
+            capacity=int(self.config.get("demo_memory_size", 128)),
+            min_score=float(self.config.get("demo_min_score", 0.0)),
+        )
+        self.teacher_agents = [copy.deepcopy(agent).eval() for agent in agents]
+        for teacher in self.teacher_agents:
+            for param in teacher.parameters():
+                param.requires_grad_(False)
         self.loss_ema = [
             {"world_loss_ema": None, "total_loss_ema": None}
             for _ in agents
@@ -34,18 +50,38 @@ class OnlineNLRITrainer:
                 "world_loss_ema": None,
                 "reservoir_loss": None,
                 "policy_loss": None,
+                "raw_policy_loss": None,
+                "clipped_policy_loss": None,
                 "bc_loss": None,
                 "value_loss": None,
+                "raw_value_loss": None,
+                "clipped_value_loss": None,
                 "value_mean": None,
+                "value_std": None,
+                "value_target_mean": None,
+                "value_target_std": None,
                 "advantage_mean": None,
+                "advantage_std": None,
+                "advantage_max_abs": None,
                 "compute_loss": None,
                 "utility_aux_loss": None,
                 "entropy_bonus": None,
                 "entropy_target_loss": None,
                 "action_diversity_loss": None,
                 "compute_target": None,
+                "distill_loss": None,
+                "teacher_entropy": None,
+                "student_entropy": None,
+                "teacher_student_kl": None,
+                "feedback_score": 0.0,
+                "demo_memory_size": 0,
+                "demo_score_mean": 0.0,
                 "loss": None,
+                "raw_total_loss": None,
                 "nonfinite_update_skipped": False,
+                "guard_update_skipped": False,
+                "skipped_updates": 0,
+                "nan_recoveries": 0,
             }
             for _ in agents
         ]
@@ -63,10 +99,7 @@ class OnlineNLRITrainer:
             {"food_eaten": 0, "collision_count": 0, "wait_count": 0}
             for _ in agents
         ]
-        self.optimizers = [
-            torch.optim.Adam(agent.parameters(), lr=self.config.get("learning_rate", 1e-3))
-            for agent in agents
-        ]
+        self.optimizers = [torch.optim.Adam(self._optimizer_param_groups(agent)) for agent in agents]
         for agent in agents:
             agent.compute_floor = float(self.config.get("compute_floor", 0.05))
             agent.obs_normalizer = self.normalizer
@@ -122,6 +155,22 @@ class OnlineNLRITrainer:
             self.repeated_action_counts[agent_id] = 1
             self.last_action_seen[agent_id] = int(action)
         self.steps_since_food[agent_id] = 0 if food_delta > 0 else self.steps_since_food[agent_id] + 1
+        feedback_transition = {
+            "energy": float(agent_info.get("energy", 0.0)),
+            "food_delta": float(food_delta),
+            "collision": float(collision),
+            "action_entropy": float(action_entropy),
+            "position_novelty": self._position_novelty(self.position_windows[agent_id]),
+            "compute_budget": float(np.asarray(debug.get("compute_budget", [0.0])).reshape(-1)[0]),
+            "z_std": float(np.std(debug.get("z", np.zeros(1)))),
+            "steps_since_food": int(self.steps_since_food[agent_id]),
+            "useful_transition_score": float(useful_transition_score),
+            "leakage": float(leakage_mean),
+        }
+        self.feedback_builder.add(agent_id, feedback_transition)
+        feedback_snapshot = self.feedback_builder.snapshot(agent_id)
+        self.demo_memory.maybe_add(feedback_snapshot["feedback_vector"], feedback_snapshot["feedback_score"])
+        demo_context = self.demo_memory.context()
 
         self.replay_buffer.push(
             agent_id=agent_id,
@@ -141,6 +190,9 @@ class OnlineNLRITrainer:
             fallback_action=int(debug.get("fallback_action", action)),
             useful_transition_score=float(useful_transition_score),
             learned_action=learned_action,
+            feedback_vector=feedback_snapshot["feedback_vector"],
+            feedback_score=float(feedback_snapshot["feedback_score"]),
+            demo_context=demo_context,
         )
 
         live = self.live_stats[agent_id]
@@ -159,11 +211,16 @@ class OnlineNLRITrainer:
         live["selected_action"] = int(debug.get("selected_action", action))
         live["fallback_used"] = bool(debug.get("fallback_used", False))
         live["uncertainty"] = float(np.asarray(debug.get("uncertainty", [0.0])).reshape(-1)[0])
+        for key in ("compute_budget", "z_mean", "z_std", "uncertainty", "action_entropy"):
+            live[key] = float(np.nan_to_num(live[key], nan=0.0, posinf=0.0, neginf=0.0))
         live["useful_transition_score"] = float(np.mean(self.utility_windows[agent_id]))
         live["action_histogram_max_fraction"] = self._histogram_max_fraction(self.learned_action_windows[agent_id])
         live["position_novelty"] = self._position_novelty(self.position_windows[agent_id])
         live["steps_since_food"] = int(self.steps_since_food[agent_id])
         live["repeated_same_action_count"] = int(self.repeated_action_counts[agent_id])
+        live["feedback_score"] = float(feedback_snapshot["feedback_score"])
+        live["demo_memory_size"] = len(self.demo_memory)
+        live["demo_score_mean"] = self.demo_memory.score_mean()
 
         live["energy_sum"] += live["energy"]
         live["energy_count"] += 1
@@ -190,7 +247,7 @@ class OnlineNLRITrainer:
         summaries = {}
         world_weight = 0.0 if self.ablation == "no-world" else float(self.config.get("world_loss_weight", 0.2))
         reservoir_weight = 0.0 if self.ablation == "no-reservoir" else float(self.config.get("reservoir_loss_weight", 1.0))
-        policy_weight = float(self.config.get("policy_loss_weight", 0.5))
+        policy_weight = float(self.config.get("actor_critic_weight", self.config.get("policy_loss_weight", 0.1)))
         latent_weight = float(self.config.get("latent_loss_weight", 0.01))
         compute_loss_weight = float(self.config.get("compute_loss_weight", 0.05))
         utility_aux_weight = float(self.config.get("utility_aux_weight", 0.1))
@@ -240,9 +297,19 @@ class OnlineNLRITrainer:
                 z, compute_budget = agent.latent_router(
                     pred_next_belief, compute_floor=float(self.config.get("compute_floor", 0.05))
                 )
+            z = torch.nan_to_num(z, nan=0.0, posinf=1.0, neginf=-1.0)
+            compute_budget = torch.nan_to_num(
+                compute_budget,
+                nan=float(self.config.get("compute_floor", 0.05)),
+                posinf=1.0,
+                neginf=float(self.config.get("compute_floor", 0.05)),
+            ).clamp(float(self.config.get("compute_floor", 0.05)), 1.0)
             reservoir_next_pred, reservoir_star_pred, leakage_pred = agent.reservoir_model(pred_next_belief)
-            policy_logits = agent.policy(pred_next_belief, z, compute_budget)
-            value_pred = agent.value_head(pred_next_belief, z, compute_budget)
+            policy_logits = torch.nan_to_num(agent.policy(pred_next_belief, z, compute_budget), nan=0.0, posinf=20.0, neginf=-20.0)
+            value_pred = torch.nan_to_num(agent.value_head(pred_next_belief, z, compute_budget), nan=0.0, posinf=10.0, neginf=-10.0)
+            feedback_context = self._stack_feedback(samples, "feedback_vector", agent.device)
+            demo_context = self._stack_feedback(samples, "demo_context", agent.device)
+            teacher_outputs = self._teacher_outputs(agent_id, obs_t, feedback_context, demo_context)
             with torch.no_grad():
                 next_encoded = agent.encoder(next_obs_t)
                 next_zero_belief = torch.zeros(next_encoded.shape[0], agent.belief_dim, device=agent.device)
@@ -254,7 +321,15 @@ class OnlineNLRITrainer:
                     next_z, next_compute_budget = agent.latent_router(
                         next_belief, compute_floor=float(self.config.get("compute_floor", 0.05))
                     )
-                next_value = agent.value_head(next_belief, next_z, next_compute_budget).squeeze(1)
+                next_z = torch.nan_to_num(next_z, nan=0.0, posinf=1.0, neginf=-1.0)
+                next_compute_budget = torch.nan_to_num(
+                    next_compute_budget,
+                    nan=float(self.config.get("compute_floor", 0.05)),
+                    posinf=1.0,
+                    neginf=float(self.config.get("compute_floor", 0.05)),
+                ).clamp(float(self.config.get("compute_floor", 0.05)), 1.0)
+                next_value = torch.nan_to_num(agent.value_head(next_belief, next_z, next_compute_budget).squeeze(1), nan=0.0)
+                next_value = torch.clamp(next_value, -float(self.config.get("return_clip", 10.0)), float(self.config.get("return_clip", 10.0)))
 
             reservoir_next_target = self._stack_reservoir(samples, "next_reservoir", agent.device)
             reservoir_star_target = self._stack_reservoir(samples, "reservoir_star", agent.device)
@@ -264,14 +339,27 @@ class OnlineNLRITrainer:
                 dtype=torch.float32,
                 device=agent.device,
             )
+            utility_scores = torch.clamp(
+                torch.nan_to_num(utility_scores, nan=0.0),
+                -float(self.config.get("utility_clip", 5.0)),
+                float(self.config.get("utility_clip", 5.0)),
+            )
             reservoir_leakage_penalty = leakage_target.mean(dim=1)
-            utility_target = torch.clamp(utility_scores - reservoir_leakage_penalty, -10.0, 10.0)
+            utility_target = torch.clamp(
+                utility_scores - reservoir_leakage_penalty,
+                -float(self.config.get("utility_clip", 5.0)),
+                float(self.config.get("utility_clip", 5.0)),
+            )
             done_mask = torch.tensor(
                 [0.0 if sample.get("done") else 1.0 for sample in samples],
                 dtype=torch.float32,
                 device=agent.device,
             )
-            value_target = utility_target + float(self.config.get("gamma", 0.99)) * done_mask * next_value
+            value_target = torch.clamp(
+                utility_target + float(self.config.get("gamma", 0.99)) * done_mask * next_value,
+                -float(self.config.get("value_target_clip", 10.0)),
+                float(self.config.get("value_target_clip", 10.0)),
+            )
             self.normalizer.update("reservoir_target", reservoir_next_target.detach().cpu().numpy())
             normalized_reservoir_next_pred = self.normalizer.normalize_tensor("reservoir_target", reservoir_next_pred)
             normalized_reservoir_next_target = self.normalizer.normalize_tensor("reservoir_target", reservoir_next_target)
@@ -299,6 +387,14 @@ class OnlineNLRITrainer:
                     normalized_leakage_target,
                     utility_scores,
                     value_target,
+                    policy_logits,
+                    value_pred,
+                    z,
+                    compute_budget,
+                    teacher_outputs["logits"],
+                    teacher_outputs["value"],
+                    teacher_outputs["z"],
+                    teacher_outputs["compute_budget"],
                 ]
             ):
                 self._mark_skip(agent_id)
@@ -327,6 +423,10 @@ class OnlineNLRITrainer:
                 uncertainty=uncertainty,
                 z=z,
                 compute_budget=compute_budget,
+                teacher_logits=teacher_outputs["logits"],
+                teacher_value=teacher_outputs["value"],
+                teacher_z=teacher_outputs["z"],
+                teacher_compute_budget=teacher_outputs["compute_budget"],
                 world_weight=world_weight,
                 reservoir_weight=reservoir_weight,
                 beta=policy_weight,
@@ -346,17 +446,41 @@ class OnlineNLRITrainer:
                 compute_target_weight=float(self.config.get("compute_target_weight", 0.05)),
                 compute_target_floor=float(self.config.get("compute_target_floor", 0.05)),
                 compute_target_ceil=float(self.config.get("compute_target_ceil", 0.8)),
+                advantage_clip=float(self.config.get("advantage_clip", 5.0)),
+                value_huber_delta=float(self.config.get("value_huber_delta", 1.0)),
+                policy_loss_clip=float(self.config.get("policy_loss_clip", 10.0)),
+                value_loss_clip=float(self.config.get("value_loss_clip", 10.0)),
+                total_loss_clip=float(self.config.get("total_loss_clip", 100.0)),
+                max_entropy_bonus=float(self.config.get("max_entropy_bonus", 0.2)),
+                log_prob_clip=float(self.config.get("log_prob_clip", 20.0)),
+                min_action_prob=float(self.config.get("min_action_prob", 1e-6)),
+                self_distill_weight=float(self.config.get("self_distill_weight", 1.0)),
+                self_distill_temperature=float(self.config.get("self_distill_temperature", 2.0)),
             )
 
             total_loss = losses["loss"]
-            if not torch.isfinite(total_loss):
-                self._mark_skip(agent_id)
+            raw_total = losses.get("raw_total_loss", total_loss)
+            if not torch.isfinite(total_loss) or not torch.isfinite(raw_total):
+                self._mark_skip(agent_id, reason="nonfinite")
+                self._recover_last_safe(agent_id)
+                continue
+            if abs(float(raw_total.detach().cpu().item())) > self.total_loss_abs_guard:
+                self._mark_skip(agent_id, reason="guard")
                 continue
 
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), self.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(agent.parameters(), self.grad_clip)
+            if not torch.isfinite(grad_norm) or float(grad_norm.detach().cpu().item()) > self.grad_abs_guard:
+                optimizer.zero_grad(set_to_none=True)
+                self._mark_skip(agent_id, reason="guard")
+                continue
             optimizer.step()
+            if not self._finite_parameters(agent):
+                self._mark_skip(agent_id, reason="nonfinite")
+                self._recover_last_safe(agent_id)
+                continue
+            self._save_last_safe(agent_id)
 
             summary = {name: float(value.detach().cpu().item()) for name, value in losses.items()}
             ema_state = self.loss_ema[agent_id]
@@ -364,8 +488,12 @@ class OnlineNLRITrainer:
             ema_state["total_loss_ema"] = self._ema(ema_state["total_loss_ema"], summary["loss"])
             summary["world_loss_ema"] = ema_state["world_loss_ema"]
             summary["nonfinite_update_skipped"] = False
+            summary["guard_update_skipped"] = False
+            summary["skipped_updates"] = int(self.loss_history[agent_id].get("skipped_updates", 0) or 0)
+            summary["nan_recoveries"] = int(self.loss_history[agent_id].get("nan_recoveries", 0) or 0)
             self.loss_history[agent_id] = summary
             summaries[agent_id] = summary
+            self._update_teacher_ema(agent_id)
 
         self.training_step += 1
         return summaries
@@ -382,6 +510,7 @@ class OnlineNLRITrainer:
             "live_stats": self.live_stats,
             "normalizer": self.normalizer.state_dict(),
             "agents": [agent.state_dict() for agent in self.agents],
+            "teacher_agents": [agent.state_dict() for agent in self.teacher_agents],
             "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
         }
         latest_path = checkpoint_dir / "latest.pt"
@@ -401,10 +530,16 @@ class OnlineNLRITrainer:
         state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         for agent, agent_state in zip(self.agents, state.get("agents", [])):
             agent.load_state_dict(agent_state)
+        teacher_states = state.get("teacher_agents", state.get("agents", []))
+        for teacher, teacher_state in zip(self.teacher_agents, teacher_states):
+            teacher.load_state_dict(teacher_state)
         optimizer_states = state.get("optimizers", [])
         if not self.eval_mode:
             for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
-                optimizer.load_state_dict(optimizer_state)
+                try:
+                    optimizer.load_state_dict(optimizer_state)
+                except ValueError:
+                    pass
         self.training_step = int(state.get("training_step", 0))
         self.env_step = int(state.get("env_step", 0))
         self.config.update(state.get("config", {}))
@@ -483,6 +618,16 @@ class OnlineNLRITrainer:
             rows.append([float(reservoir.get(name, 0.0)) for name in ordered_keys])
         return torch.tensor(rows, dtype=torch.float32, device=device)
 
+    def _stack_feedback(self, samples: List[Dict[str, Any]], key: str, device):
+        rows = []
+        for sample in samples:
+            value = sample.get(key)
+            if value is None:
+                value = np.zeros(self.feedback_builder.dim, dtype=np.float32)
+            rows.append(np.asarray(value, dtype=np.float32))
+        array = np.nan_to_num(np.stack(rows, axis=0), nan=0.0, posinf=1.0, neginf=-1.0)
+        return torch.tensor(array, dtype=torch.float32, device=device)
+
     def _update_normalizers(self, obs, next_obs, agent_info):
         self.normalizer.update("perception_cone", obs["perception_cone"])
         self.normalizer.update("perception_cone", next_obs["perception_cone"])
@@ -525,6 +670,13 @@ class OnlineNLRITrainer:
             flags.append("fb_early")
         if row.get("nonfinite_update_skipped"):
             flags.append("skip_nf")
+        if row.get("guard_update_skipped"):
+            flags.append("policy_loss_guard")
+        if abs(row.get("value_mean", 0.0) or 0.0) > 20.0:
+            flags.append("value_explosion")
+        advantage_clip = float(self.config.get("advantage_clip", 5.0))
+        if (row.get("advantage_max_abs") or 0.0) > advantage_clip + 1e-3:
+            flags.append("advantage_explosion")
         if row.get("action_histogram_max_fraction", 0.0) > 0.8:
             flags.append("action_collapse")
         if row.get("steps_since_food", 0) >= 500:
@@ -545,9 +697,29 @@ class OnlineNLRITrainer:
         steps_since_warmup = max(0, self.env_step - int(self.config.get("warmup_steps", 0)))
         return max(min_value, start - decay * steps_since_warmup)
 
-    def _mark_skip(self, agent_id):
+    def _optimizer_param_groups(self, agent):
+        model_lr = float(self.config.get("model_lr", self.config.get("learning_rate", 1e-4)))
+        policy_lr = float(self.config.get("policy_lr", 3e-5))
+        value_lr = float(self.config.get("value_lr", 3e-5))
+        router_lr = float(self.config.get("router_lr", policy_lr))
+        return [
+            {
+                "params": list(agent.encoder.parameters())
+                + list(agent.feedback_encoder.parameters())
+                + list(agent.world_model.parameters())
+                + list(agent.reservoir_model.parameters()),
+                "lr": model_lr,
+            },
+            {"params": agent.latent_router.parameters(), "lr": router_lr},
+            {"params": agent.policy.parameters(), "lr": policy_lr},
+            {"params": agent.value_head.parameters(), "lr": value_lr},
+        ]
+
+    def _mark_skip(self, agent_id, reason="nonfinite"):
         summary = dict(self.loss_history[agent_id])
-        summary["nonfinite_update_skipped"] = True
+        summary["nonfinite_update_skipped"] = reason == "nonfinite"
+        summary["guard_update_skipped"] = reason == "guard"
+        summary["skipped_updates"] = int(summary.get("skipped_updates", 0) or 0) + 1
         self.loss_history[agent_id] = summary
 
     def _finite_batch(self, batch: Dict[str, np.ndarray]):
@@ -555,6 +727,70 @@ class OnlineNLRITrainer:
 
     def _finite_tensor(self, tensors: List[torch.Tensor]):
         return all(torch.isfinite(tensor).all().item() for tensor in tensors)
+
+    def _teacher_outputs(self, agent_id, obs_t, feedback_context, demo_context):
+        teacher = self.teacher_agents[agent_id]
+        with torch.no_grad():
+            outputs = teacher.teacher_forward(obs_t, feedback_context=feedback_context, demo_context=demo_context)
+        return {
+            "logits": torch.nan_to_num(outputs["logits"], nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0),
+            "value": torch.nan_to_num(outputs["value"], nan=0.0, posinf=10.0, neginf=-10.0).clamp(-10.0, 10.0),
+            "z": torch.nan_to_num(outputs["z"], nan=0.0, posinf=1.0, neginf=-1.0),
+            "compute_budget": torch.nan_to_num(
+                outputs["compute_budget"],
+                nan=float(self.config.get("compute_floor", 0.05)),
+                posinf=1.0,
+                neginf=float(self.config.get("compute_floor", 0.05)),
+            ).clamp(float(self.config.get("compute_floor", 0.05)), 1.0),
+        }
+
+    def _update_teacher_ema(self, agent_id):
+        rate = float(self.teacher_ema_rate)
+        teacher = self.teacher_agents[agent_id]
+        student = self.agents[agent_id]
+        with torch.no_grad():
+            for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
+                teacher_param.data.mul_(1.0 - rate).add_(student_param.data, alpha=rate)
+            for teacher_buffer, student_buffer in zip(teacher.buffers(), student.buffers()):
+                teacher_buffer.data.copy_(student_buffer.data)
+
+    def _finite_parameters(self, agent):
+        return all(torch.isfinite(param).all().item() for param in agent.parameters())
+
+    def _save_last_safe(self, agent_id):
+        path = self._last_safe_path(agent_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "agent_id": agent_id,
+            "training_step": self.training_step,
+            "env_step": self.env_step,
+            "agent": self.agents[agent_id].state_dict(),
+            "optimizer": self.optimizers[agent_id].state_dict(),
+            "normalizer": self.normalizer.state_dict(),
+        }
+        torch.save(payload, path)
+
+    def _recover_last_safe(self, agent_id):
+        path = self._last_safe_path(agent_id)
+        summary = dict(self.loss_history[agent_id])
+        summary["nan_recoveries"] = int(summary.get("nan_recoveries", 0) or 0) + 1
+        self.loss_history[agent_id] = summary
+        if not path.exists():
+            return False
+        state = torch.load(path, map_location=self.device, weights_only=False)
+        if int(state.get("agent_id", agent_id)) != agent_id:
+            return False
+        self.agents[agent_id].load_state_dict(state["agent"])
+        self.optimizers[agent_id].load_state_dict(state["optimizer"])
+        if "normalizer" in state:
+            self.normalizer.load_state_dict(state["normalizer"])
+        return True
+
+    def _last_safe_path(self, agent_id):
+        path = Path(self.nan_recovery_checkpoint)
+        if len(self.agents) <= 1:
+            return path
+        return path.with_name(f"{path.stem}_agent_{agent_id}{path.suffix}")
 
     def _imagined_actions(self, agent_id, agent, belief, z, compute_budget, policy_logits):
         candidates = max(1, int(self.config.get("imagined_candidates", 4)))
@@ -618,8 +854,17 @@ class OnlineNLRITrainer:
             "uncertainty": 0.0,
             "useful_transition_score": 0.0,
             "value_loss": None,
+            "raw_value_loss": None,
+            "clipped_value_loss": None,
             "value_mean": 0.0,
+            "value_std": 0.0,
+            "value_target_mean": 0.0,
+            "value_target_std": 0.0,
             "advantage_mean": 0.0,
+            "advantage_std": 0.0,
+            "advantage_max_abs": 0.0,
+            "raw_policy_loss": None,
+            "clipped_policy_loss": None,
             "entropy_target_loss": None,
             "action_diversity_loss": None,
             "action_histogram_max_fraction": 0.0,
@@ -627,6 +872,18 @@ class OnlineNLRITrainer:
             "steps_since_food": 0,
             "repeated_same_action_count": 0,
             "compute_target": 0.0,
+            "distill_loss": None,
+            "teacher_entropy": 0.0,
+            "student_entropy": 0.0,
+            "teacher_student_kl": 0.0,
+            "feedback_score": 0.0,
+            "demo_memory_size": 0,
+            "demo_score_mean": 0.0,
+            "raw_total_loss": None,
+            "guard_update_skipped": False,
+            "nonfinite_update_skipped": False,
+            "skipped_updates": 0,
+            "nan_recoveries": 0,
             "energy_sum": 0.0,
             "energy_count": 0,
             "leakage_sum": 0.0,

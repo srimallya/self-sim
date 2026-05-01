@@ -41,15 +41,34 @@ CSV_COLUMNS = [
     "reservoir_loss",
     "policy_loss",
     "value_loss",
+    "raw_value_loss",
+    "clipped_value_loss",
     "value_mean",
+    "value_std",
+    "value_target_mean",
+    "value_target_std",
     "advantage_mean",
+    "advantage_std",
+    "advantage_max_abs",
+    "raw_policy_loss",
+    "clipped_policy_loss",
     "entropy_target_loss",
     "action_diversity_loss",
     "action_histogram_max_fraction",
     "position_novelty",
     "steps_since_food",
     "compute_target",
+    "distill_loss",
+    "teacher_entropy",
+    "student_entropy",
+    "teacher_student_kl",
+    "demo_memory_size",
+    "feedback_score",
+    "demo_score_mean",
+    "skipped_updates",
+    "nan_recoveries",
     "useful_transition_score",
+    "raw_total_loss",
     "total_loss",
     "ablation",
     "eval_mode",
@@ -71,7 +90,10 @@ def build_parser():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--buffer-capacity", type=int, default=20000)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--model-lr", type=float, default=1e-4)
+    parser.add_argument("--policy-lr", type=float, default=3e-5)
+    parser.add_argument("--value-lr", type=float, default=3e-5)
     parser.add_argument("--fallback-prob", type=float, default=1.0)
     parser.add_argument("--fallback-decay", type=float, default=0.0002)
     parser.add_argument("--min-fallback-prob", type=float, default=0.25)
@@ -112,6 +134,27 @@ def build_parser():
     parser.add_argument("--compute-target-weight", type=float, default=0.05)
     parser.add_argument("--compute-target-floor", type=float, default=0.05)
     parser.add_argument("--compute-target-ceil", type=float, default=0.8)
+    parser.add_argument("--utility-clip", type=float, default=5.0)
+    parser.add_argument("--return-clip", type=float, default=10.0)
+    parser.add_argument("--advantage-clip", type=float, default=5.0)
+    parser.add_argument("--value-target-clip", type=float, default=10.0)
+    parser.add_argument("--value-huber-delta", type=float, default=1.0)
+    parser.add_argument("--policy-loss-clip", type=float, default=10.0)
+    parser.add_argument("--value-loss-clip", type=float, default=10.0)
+    parser.add_argument("--total-loss-clip", type=float, default=100.0)
+    parser.add_argument("--max-entropy-bonus", type=float, default=0.2)
+    parser.add_argument("--log-prob-clip", type=float, default=20.0)
+    parser.add_argument("--min-action-prob", type=float, default=1e-6)
+    parser.add_argument("--total-loss-abs-guard", type=float, default=1000.0)
+    parser.add_argument("--grad-abs-guard", type=float, default=100.0)
+    parser.add_argument("--nan-recovery-checkpoint", type=str, default="checkpoints/nlri/last_safe.pt")
+    parser.add_argument("--self-distill-weight", type=float, default=1.0)
+    parser.add_argument("--self-distill-temperature", type=float, default=2.0)
+    parser.add_argument("--teacher-ema-rate", type=float, default=0.01)
+    parser.add_argument("--feedback-window", type=int, default=100)
+    parser.add_argument("--demo-memory-size", type=int, default=128)
+    parser.add_argument("--demo-min-score", type=float, default=0.0)
+    parser.add_argument("--actor-critic-weight", type=float, default=0.1)
     return parser
 
 
@@ -190,6 +233,9 @@ def run_session(args):
         config={
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
+            "model_lr": args.model_lr,
+            "policy_lr": args.policy_lr,
+            "value_lr": args.value_lr,
             "warmup_steps": args.warmup_steps,
             "checkpoint_dir": args.checkpoint_dir,
             "disable_fallback_after": args.disable_fallback_after,
@@ -225,6 +271,27 @@ def run_session(args):
             "compute_target_weight": args.compute_target_weight,
             "compute_target_floor": args.compute_target_floor,
             "compute_target_ceil": args.compute_target_ceil,
+            "utility_clip": args.utility_clip,
+            "return_clip": args.return_clip,
+            "advantage_clip": args.advantage_clip,
+            "value_target_clip": args.value_target_clip,
+            "value_huber_delta": args.value_huber_delta,
+            "policy_loss_clip": args.policy_loss_clip,
+            "value_loss_clip": args.value_loss_clip,
+            "total_loss_clip": args.total_loss_clip,
+            "max_entropy_bonus": args.max_entropy_bonus,
+            "log_prob_clip": args.log_prob_clip,
+            "min_action_prob": args.min_action_prob,
+            "total_loss_abs_guard": args.total_loss_abs_guard,
+            "grad_abs_guard": args.grad_abs_guard,
+            "nan_recovery_checkpoint": args.nan_recovery_checkpoint,
+            "self_distill_weight": args.self_distill_weight,
+            "self_distill_temperature": args.self_distill_temperature,
+            "teacher_ema_rate": args.teacher_ema_rate,
+            "feedback_window": args.feedback_window,
+            "demo_memory_size": args.demo_memory_size,
+            "demo_min_score": args.demo_min_score,
+            "actor_critic_weight": args.actor_critic_weight,
         },
     )
     latent_collector = LatentDiagnosticsCollector()
@@ -407,15 +474,34 @@ def snapshot_metrics_rows(step, trainer_metrics, args):
                 "reservoir_loss": metrics_row.get("reservoir_loss"),
                 "policy_loss": metrics_row.get("policy_loss"),
                 "value_loss": metrics_row.get("value_loss"),
+                "raw_value_loss": metrics_row.get("raw_value_loss"),
+                "clipped_value_loss": metrics_row.get("clipped_value_loss"),
                 "value_mean": metrics_row.get("value_mean"),
+                "value_std": metrics_row.get("value_std"),
+                "value_target_mean": metrics_row.get("value_target_mean"),
+                "value_target_std": metrics_row.get("value_target_std"),
                 "advantage_mean": metrics_row.get("advantage_mean"),
+                "advantage_std": metrics_row.get("advantage_std"),
+                "advantage_max_abs": metrics_row.get("advantage_max_abs"),
+                "raw_policy_loss": metrics_row.get("raw_policy_loss"),
+                "clipped_policy_loss": metrics_row.get("clipped_policy_loss"),
                 "entropy_target_loss": metrics_row.get("entropy_target_loss"),
                 "action_diversity_loss": metrics_row.get("action_diversity_loss"),
                 "action_histogram_max_fraction": float(metrics_row["action_histogram_max_fraction"]),
                 "position_novelty": float(metrics_row["position_novelty"]),
                 "steps_since_food": int(metrics_row["steps_since_food"]),
                 "compute_target": float(metrics_row.get("compute_target") or 0.0),
+                "distill_loss": metrics_row.get("distill_loss"),
+                "teacher_entropy": float(metrics_row.get("teacher_entropy") or 0.0),
+                "student_entropy": float(metrics_row.get("student_entropy") or 0.0),
+                "teacher_student_kl": float(metrics_row.get("teacher_student_kl") or 0.0),
+                "demo_memory_size": int(metrics_row.get("demo_memory_size") or 0),
+                "feedback_score": float(metrics_row.get("feedback_score") or 0.0),
+                "demo_score_mean": float(metrics_row.get("demo_score_mean") or 0.0),
+                "skipped_updates": int(metrics_row.get("skipped_updates") or 0),
+                "nan_recoveries": int(metrics_row.get("nan_recoveries") or 0),
                 "useful_transition_score": float(metrics_row["useful_transition_score"]),
+                "raw_total_loss": metrics_row.get("raw_total_loss"),
                 "total_loss": metrics_row.get("loss"),
                 "ablation": args.ablation,
                 "eval_mode": bool(args.eval),
@@ -438,9 +524,12 @@ def format_agent_metrics(row):
         f"reservoir_loss={fmt_loss(row['reservoir_loss'])} "
         f"policy_loss={fmt_loss(row['policy_loss'])} "
         f"value_loss={fmt_loss(row['value_loss'])} "
+        f"distill={fmt_loss(row['distill_loss'])} "
+        f"adv_max={fmt_loss(row['advantage_max_abs'])} "
         f"hist_max={row['action_histogram_max_fraction']:.2f} "
         f"novelty={row['position_novelty']:.2f} "
         f"no_food={row['steps_since_food']} "
+        f"skips={row['skipped_updates']} nan_rec={row['nan_recoveries']} "
         f"total_loss={fmt_loss(row['total_loss'])}{warning_suffix}"
     )
 
@@ -460,7 +549,10 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
     max_steps_since_food = int(max([row["steps_since_food"] for row in per_agent] or [0]))
     losses = [row.get("loss") for row in per_agent if row.get("loss") is not None]
     value_losses = [row.get("value_loss") for row in per_agent if row.get("value_loss") is not None]
+    distill_losses = [row.get("distill_loss") for row in per_agent if row.get("distill_loss") is not None]
     world_loss_emas = [row.get("world_loss_ema") for row in per_agent if row.get("world_loss_ema") is not None]
+    skipped_updates = int(sum(row.get("skipped_updates", 0) or 0 for row in per_agent))
+    nan_recoveries = int(sum(row.get("nan_recoveries", 0) or 0 for row in per_agent))
     return {
         "mean_energy": mean_energy,
         "total_food_eaten": total_food_eaten,
@@ -475,7 +567,12 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
         "max_steps_since_food": max_steps_since_food,
         "final_total_loss": safe_mean(losses),
         "value_loss": safe_mean(value_losses),
+        "distill_loss": safe_mean(distill_losses),
+        "demo_memory_size": int(max([row.get("demo_memory_size", 0) for row in per_agent] or [0])),
+        "demo_score_mean": safe_mean([row.get("demo_score_mean", 0.0) for row in per_agent]),
         "world_loss_ema": safe_mean(world_loss_emas),
+        "skipped_updates": skipped_updates,
+        "nan_recoveries": nan_recoveries,
         "checkpoint_path": checkpoint_path or "",
         "loaded_checkpoint": loaded_checkpoint or "",
         "checkpoint_step": int(checkpoint_step),
@@ -496,13 +593,28 @@ def write_metrics_csv(path, rows):
                 "reservoir_loss",
                 "policy_loss",
                 "value_loss",
+                "raw_value_loss",
+                "clipped_value_loss",
                 "value_mean",
+                "value_std",
+                "value_target_mean",
+                "value_target_std",
                 "advantage_mean",
+                "advantage_std",
+                "advantage_max_abs",
+                "raw_policy_loss",
+                "clipped_policy_loss",
                 "entropy_target_loss",
                 "action_diversity_loss",
+                "distill_loss",
+                "teacher_entropy",
+                "student_entropy",
+                "teacher_student_kl",
+                "raw_total_loss",
                 "total_loss",
             ):
-                serialized[loss_key] = "" if serialized[loss_key] is None else f"{serialized[loss_key]:.6f}"
+                value = serialized[loss_key]
+                serialized[loss_key] = "" if value is None or not np.isfinite(float(value)) else f"{float(value):.6f}"
             writer.writerow(serialized)
 
 
@@ -510,12 +622,17 @@ def entropy(probs):
     if probs is None:
         return 0.0
     probs = np.asarray(probs, dtype=np.float32)
+    probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    total = float(probs.sum())
+    if total <= 0.0:
+        return 0.0
+    probs = probs / total
     return float(-(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
 
 
 def _first_scalar(value):
     array = np.asarray(value, dtype=np.float32).reshape(-1)
-    return float(array[0]) if array.size else 0.0
+    return float(np.nan_to_num(array[0], nan=0.0, posinf=0.0, neginf=0.0)) if array.size else 0.0
 
 
 def np_mean_dict(values):
@@ -525,14 +642,14 @@ def np_mean_dict(values):
 
 
 def safe_mean(values):
-    values = list(values)
+    values = [float(value) for value in values if value is not None and np.isfinite(float(value))]
     if not values:
         return 0.0
     return float(sum(values) / len(values))
 
 
 def fmt_loss(value):
-    return "n/a" if value is None else f"{float(value):.4f}"
+    return "n/a" if value is None or not np.isfinite(float(value)) else f"{float(value):.4f}"
 
 
 def _jsonable(value):

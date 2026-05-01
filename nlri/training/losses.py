@@ -27,6 +27,10 @@ def compute_nlri_loss(
     uncertainty: torch.Tensor,
     z: torch.Tensor,
     compute_budget: torch.Tensor,
+    teacher_logits: torch.Tensor | None = None,
+    teacher_value: torch.Tensor | None = None,
+    teacher_z: torch.Tensor | None = None,
+    teacher_compute_budget: torch.Tensor | None = None,
     world_weight: float = 1.0,
     reservoir_weight: float = 1.0,
     alpha: float = 1.0,
@@ -51,6 +55,16 @@ def compute_nlri_loss(
     compute_target_weight: float = 0.05,
     compute_target_floor: float = 0.05,
     compute_target_ceil: float = 0.8,
+    advantage_clip: float = 5.0,
+    value_huber_delta: float = 1.0,
+    policy_loss_clip: float = 10.0,
+    value_loss_clip: float = 10.0,
+    total_loss_clip: float = 100.0,
+    max_entropy_bonus: float = 0.2,
+    log_prob_clip: float = 20.0,
+    min_action_prob: float = 1e-6,
+    self_distill_weight: float = 1.0,
+    self_distill_temperature: float = 2.0,
 ) -> Dict[str, torch.Tensor]:
     world_prediction_loss = F.smooth_l1_loss(pred_next_belief, target_obs_embedding) + F.smooth_l1_loss(
         pred_obs_embedding, target_obs_embedding
@@ -62,16 +76,29 @@ def compute_nlri_loss(
     )
     value_target = value_target.detach()
     value_pred_flat = value_pred.squeeze(1)
-    value_loss = F.smooth_l1_loss(value_pred_flat, value_target)
-    bc_ce = F.cross_entropy(policy_logits, fallback_actions, reduction="none")
+    raw_value_loss = F.smooth_l1_loss(value_pred_flat, value_target, beta=value_huber_delta)
+    value_loss = torch.clamp(raw_value_loss, max=value_loss_clip)
+    safe_logits = torch.nan_to_num(policy_logits, nan=0.0, posinf=log_prob_clip, neginf=-log_prob_clip)
+    safe_logits = torch.clamp(safe_logits, min=-log_prob_clip, max=log_prob_clip)
+    bc_ce = F.cross_entropy(safe_logits, fallback_actions, reduction="none")
     bc_loss = (bc_ce * bc_mask).sum() / torch.clamp(bc_mask.sum(), min=1.0)
-    probs = torch.softmax(policy_logits, dim=1)
-    log_probs = torch.log_softmax(policy_logits, dim=1)
+    probs = torch.softmax(safe_logits, dim=1)
+    probs = torch.clamp(probs, min=min_action_prob)
+    probs = probs / probs.sum(dim=1, keepdim=True)
+    log_probs = torch.log(probs)
     entropy_bonus = -(probs * log_probs).sum(dim=1).mean()
     chosen_log_probs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
-    advantage = (value_target - value_pred_flat).detach()
+    chosen_log_probs = torch.clamp(chosen_log_probs, min=-log_prob_clip, max=0.0)
+    action_probs = probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+    valid_action_mask = (action_probs >= min_action_prob).float()
+    raw_advantage = torch.clamp((value_target - value_pred_flat).detach(), -advantage_clip, advantage_clip)
+    advantage = raw_advantage
     advantage = (advantage - advantage.mean()) / torch.clamp(advantage.std(unbiased=False), min=1e-3)
-    policy_loss = -(chosen_log_probs * advantage).mean()
+    advantage = torch.clamp(advantage, -advantage_clip, advantage_clip).detach()
+    raw_policy_loss = -((chosen_log_probs * advantage) * valid_action_mask).sum() / torch.clamp(
+        valid_action_mask.sum(), min=1.0
+    )
+    policy_loss = torch.clamp(raw_policy_loss, min=-policy_loss_clip, max=policy_loss_clip)
     utility_scores = torch.clamp(utility_scores, -5.0, 5.0)
     utility_aux_loss = -(chosen_log_probs * utility_scores.detach()).mean()
     entropy_gap = torch.relu(torch.as_tensor(entropy_target, device=policy_logits.device) - entropy_bonus)
@@ -81,7 +108,7 @@ def compute_nlri_loss(
     histogram = torch.clamp(action_histogram.to(policy_logits.device), min=1e-6)
     histogram = histogram / histogram.sum()
     action_diversity_loss = torch.sum(histogram * torch.log(histogram * histogram.numel()))
-    imagined_ce = F.cross_entropy(policy_logits, imagined_actions, reduction="none")
+    imagined_ce = F.cross_entropy(safe_logits, imagined_actions, reduction="none")
     imagined_policy_loss = (imagined_ce * imagined_mask).sum() / torch.clamp(imagined_mask.sum(), min=1.0)
     operating_cost = compute_budget.mean()
     search_cost = leakage_pred.mean()
@@ -100,13 +127,39 @@ def compute_nlri_loss(
         - compute_leakage_weight * (detached_leakage * compute_budget.squeeze(1)).mean()
         + compute_variance_penalty
     )
+    distill_loss = torch.zeros((), device=policy_logits.device)
+    teacher_entropy = torch.zeros((), device=policy_logits.device)
+    teacher_student_kl = torch.zeros((), device=policy_logits.device)
+    value_distill_loss = torch.zeros((), device=policy_logits.device)
+    compute_distill_loss = torch.zeros((), device=policy_logits.device)
+    z_distill_loss = torch.zeros((), device=policy_logits.device)
+    if teacher_logits is not None and teacher_value is not None and teacher_compute_budget is not None:
+        safe_teacher_logits = torch.nan_to_num(teacher_logits.detach(), nan=0.0, posinf=log_prob_clip, neginf=-log_prob_clip)
+        safe_teacher_logits = torch.clamp(safe_teacher_logits, -log_prob_clip, log_prob_clip)
+        temp = max(float(self_distill_temperature), 1e-3)
+        teacher_probs = torch.softmax(safe_teacher_logits / temp, dim=1)
+        student_log_probs = torch.log_softmax(safe_logits / temp, dim=1)
+        teacher_probs = torch.clamp(teacher_probs, min=min_action_prob)
+        teacher_probs = teacher_probs / teacher_probs.sum(dim=1, keepdim=True)
+        teacher_entropy = -(teacher_probs * torch.log(torch.clamp(teacher_probs, min=1e-8))).sum(dim=1).mean()
+        teacher_student_kl = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temp * temp)
+        value_distill_loss = F.smooth_l1_loss(value_pred_flat, teacher_value.detach().squeeze(1), beta=value_huber_delta)
+        compute_distill_loss = F.mse_loss(compute_budget, teacher_compute_budget.detach())
+        if teacher_z is not None:
+            z_distill_loss = F.mse_loss(z, teacher_z.detach())
+        distill_loss = torch.clamp(
+            teacher_student_kl + value_distill_loss + compute_distill_loss + 0.1 * z_distill_loss,
+            max=10.0,
+        )
 
-    total = (
+    entropy_contribution = torch.clamp(entropy_weight * entropy_bonus, min=0.0, max=max_entropy_bonus)
+    raw_total = (
         world_weight * world_prediction_loss
         + reservoir_weight * alpha * reservoir_loss
         + beta * policy_loss
         + bc_weight * bc_loss
-        - entropy_weight * entropy_bonus
+        - entropy_contribution
+        + self_distill_weight * distill_loss
         + value_loss_weight * value_loss
         + entropy_target_weight * (entropy_target_loss + 0.25 * uniform_kl_loss)
         + action_diversity_weight * action_diversity_loss
@@ -119,16 +172,35 @@ def compute_nlri_loss(
         + compute_target_weight * compute_target_loss
         + utility_aux_weight * utility_aux_loss
     )
+    total = torch.clamp(raw_total, min=-total_loss_clip, max=total_loss_clip)
     return {
         "loss": total,
+        "raw_total_loss": raw_total,
         "world_prediction_loss": world_prediction_loss,
         "reservoir_loss": reservoir_loss,
         "policy_loss": policy_loss,
+        "raw_policy_loss": raw_policy_loss,
+        "clipped_policy_loss": policy_loss,
         "value_loss": value_loss,
+        "raw_value_loss": raw_value_loss,
+        "clipped_value_loss": value_loss,
         "value_mean": value_pred_flat.mean(),
+        "value_std": value_pred_flat.std(unbiased=False),
+        "value_target_mean": value_target.mean(),
+        "value_target_std": value_target.std(unbiased=False),
         "advantage_mean": advantage.mean(),
+        "advantage_std": advantage.std(unbiased=False),
+        "advantage_max_abs": advantage.abs().max(),
         "bc_loss": bc_loss,
         "entropy_bonus": entropy_bonus,
+        "student_entropy": entropy_bonus,
+        "teacher_entropy": teacher_entropy,
+        "teacher_student_kl": teacher_student_kl,
+        "distill_loss": distill_loss,
+        "value_distill_loss": value_distill_loss,
+        "compute_distill_loss": compute_distill_loss,
+        "z_distill_loss": z_distill_loss,
+        "entropy_contribution": entropy_contribution,
         "entropy_target_loss": entropy_target_loss,
         "uniform_kl_loss": uniform_kl_loss,
         "action_diversity_loss": action_diversity_loss,
