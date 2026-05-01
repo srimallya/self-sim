@@ -120,7 +120,7 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--seeds", type=int, default=5)
     parser.add_argument("--seed-start", type=int, default=42)
-    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--fps", type=int, default=None, help="Defaults to uncapped with --dummy-sdl, otherwise 24.")
     parser.add_argument("--dummy-sdl", action="store_true")
     parser.add_argument("--run-dir", type=str, default="")
     parser.add_argument("--stagnation-threshold", type=int, default=500)
@@ -131,6 +131,7 @@ def main():
     args = parse_args()
     if args.dummy_sdl:
         os.environ["SDL_VIDEODRIVER"] = "dummy"
+    fps = 0 if args.fps is None and args.dummy_sdl else (24 if args.fps is None else args.fps)
 
     run_dir = Path(args.run_dir) if args.run_dir else Path("runs/nlri_eval") / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +148,7 @@ def main():
             session_args = build_runtime_args(
                 {
                     "steps": args.steps,
-                    "fps": args.fps,
+                    "fps": fps,
                     "seed": seed,
                     "eval": True,
                     "resume": condition["resume"],
@@ -161,6 +162,7 @@ def main():
                     "self_distill_weight": condition["self_distill_weight"],
                     "run_dir": str(session_run_dir),
                     "quiet": True,
+                    "render_mode": "none" if args.dummy_sdl else "human",
                 }
             )
             result = run_session(session_args)

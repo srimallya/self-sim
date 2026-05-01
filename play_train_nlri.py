@@ -102,6 +102,7 @@ def build_parser():
     parser.add_argument("--run-dir", type=str, default="")
     parser.add_argument("--checkpoint-path", type=str, default="")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--render-mode", choices=["human", "none"], default="human")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--loss-ema-beta", type=float, default=0.98)
     parser.add_argument("--bc-weight", type=float, default=1.0)
@@ -220,7 +221,7 @@ def run_session(args):
         json.dump(config_dict, handle, indent=2, sort_keys=True)
 
     max_steps = args.steps if args.steps > 0 else 1_000_000_000
-    env = MazeReservoirEnv(render_mode="human", max_steps=max_steps)
+    env = MazeReservoirEnv(render_mode=None if args.render_mode == "none" else "human", max_steps=max_steps)
     if env.viewer is not None:
         env.viewer.fps = args.fps
 
