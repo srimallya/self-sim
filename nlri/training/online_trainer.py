@@ -31,7 +31,14 @@ class OnlineNLRITrainer:
         self.loss_ema_beta = float(self.config.get("loss_ema_beta", 0.98))
         self.normalizer = MultiNormalizer(clamp=10.0)
         self.teacher_ema_rate = float(self.config.get("teacher_ema_rate", 0.01))
-        self.feedback_builder = TrajectoryFeedbackBuilder(window=int(self.config.get("feedback_window", 100)))
+        self.feedback_builder = TrajectoryFeedbackBuilder(
+            window=int(self.config.get("feedback_window", 100)),
+            energy_delta_weight=float(self.config.get("clean_energy_delta_weight", 0.2)),
+            collision_weight=float(self.config.get("demo_collision_weight", 0.5)),
+            movement_weight=float(self.config.get("demo_movement_weight", 0.2)),
+            novelty_weight=float(self.config.get("demo_novelty_weight", 0.2)),
+            leakage_weight=float(self.config.get("demo_leakage_weight", 1.0)),
+        )
         self.demo_memory = DemoMemory(
             capacity=int(self.config.get("demo_memory_size", 128)),
             min_score=float(self.config.get("demo_min_score", 0.0)),
@@ -70,6 +77,10 @@ class OnlineNLRITrainer:
                 "action_diversity_loss": None,
                 "compute_target": None,
                 "distill_loss": None,
+                "collision_bce_loss": None,
+                "movement_cost_huber_loss": None,
+                "progress_huber_loss": None,
+                "clean_utility_aux_loss": None,
                 "teacher_entropy": None,
                 "student_entropy": None,
                 "teacher_student_kl": None,
@@ -89,6 +100,7 @@ class OnlineNLRITrainer:
         self.fallback_windows = [deque(maxlen=100) for _ in agents]
         self.leakage_windows = [deque(maxlen=100) for _ in agents]
         self.movement_cost_windows = [deque(maxlen=100) for _ in agents]
+        self.collision_windows = [deque(maxlen=100) for _ in agents]
         self.utility_windows = [deque(maxlen=100) for _ in agents]
         self.learned_action_windows = [deque(maxlen=100) for _ in agents]
         self.position_windows = [deque(maxlen=100) for _ in agents]
@@ -142,6 +154,7 @@ class OnlineNLRITrainer:
         self.fallback_windows[agent_id].append(fallback_flag)
         self.leakage_windows[agent_id].append(leakage_mean)
         self.movement_cost_windows[agent_id].append(float(movement_cost))
+        self.collision_windows[agent_id].append(float(collision_delta))
         self.utility_windows[agent_id].append(float(useful_transition_score))
         position = tuple(agent_info.get("position", ()))
         if position:
@@ -155,12 +168,18 @@ class OnlineNLRITrainer:
             self.repeated_action_counts[agent_id] = 1
             self.last_action_seen[agent_id] = int(action)
         self.steps_since_food[agent_id] = 0 if food_delta > 0 else self.steps_since_food[agent_id] + 1
+        position_novelty = self._position_novelty(self.position_windows[agent_id])
+        local_loop_score = self._local_loop_score(self.position_windows[agent_id])
+        clean_utility = self._clean_utility(food_delta, energy_delta, collision_delta, movement_cost, position_novelty)
         feedback_transition = {
             "energy": float(agent_info.get("energy", 0.0)),
+            "energy_delta": float(energy_delta / 1000.0),
             "food_delta": float(food_delta),
             "collision": float(collision),
+            "movement_cost": float(movement_cost),
             "action_entropy": float(action_entropy),
-            "position_novelty": self._position_novelty(self.position_windows[agent_id]),
+            "position_novelty": position_novelty,
+            "local_loop_score": local_loop_score,
             "compute_budget": float(np.asarray(debug.get("compute_budget", [0.0])).reshape(-1)[0]),
             "z_std": float(np.std(debug.get("z", np.zeros(1)))),
             "steps_since_food": int(self.steps_since_food[agent_id]),
@@ -189,6 +208,11 @@ class OnlineNLRITrainer:
             fallback_used=bool(debug.get("fallback_used", False)),
             fallback_action=int(debug.get("fallback_action", action)),
             useful_transition_score=float(useful_transition_score),
+            clean_utility=float(clean_utility),
+            food_delta=int(food_delta),
+            collision_delta=int(collision_delta),
+            energy_delta=float(energy_delta),
+            progress=float(np.linalg.norm(np.asarray(next_obs.get("last_movement", [0.0, 0.0]), dtype=np.float32))),
             learned_action=learned_action,
             feedback_vector=feedback_snapshot["feedback_vector"],
             feedback_score=float(feedback_snapshot["feedback_score"]),
@@ -215,7 +239,16 @@ class OnlineNLRITrainer:
             live[key] = float(np.nan_to_num(live[key], nan=0.0, posinf=0.0, neginf=0.0))
         live["useful_transition_score"] = float(np.mean(self.utility_windows[agent_id]))
         live["action_histogram_max_fraction"] = self._histogram_max_fraction(self.learned_action_windows[agent_id])
-        live["position_novelty"] = self._position_novelty(self.position_windows[agent_id])
+        live["position_novelty"] = position_novelty
+        live["local_loop_score"] = local_loop_score
+        live["wall_contact_rate"] = float(np.mean([1.0 if v else 0.0 for v in list(self.collision_windows[agent_id])]))
+        live["food_per_collision"] = live_food_ratio(live["food_eaten"], live["collision_count"])
+        live["food_per_100_steps"] = 100.0 * live["food_eaten"] / max(1, live["energy_count"] + 1)
+        live["collisions_per_100_steps"] = 100.0 * live["collision_count"] / max(1, live["energy_count"] + 1)
+        live["movement_cost_per_food"] = float(np.sum(self.movement_cost_windows[agent_id])) / max(1.0, float(live["food_eaten"]))
+        live["useful_score_per_100_steps"] = 100.0 * live["useful_transition_score"]
+        live["energy_slope"] = float(energy_delta / 1000.0)
+        live["clean_utility"] = clean_utility
         live["steps_since_food"] = int(self.steps_since_food[agent_id])
         live["repeated_same_action_count"] = int(self.repeated_action_counts[agent_id])
         live["feedback_score"] = float(feedback_snapshot["feedback_score"])
@@ -305,6 +338,7 @@ class OnlineNLRITrainer:
                 neginf=float(self.config.get("compute_floor", 0.05)),
             ).clamp(float(self.config.get("compute_floor", 0.05)), 1.0)
             reservoir_next_pred, reservoir_star_pred, leakage_pred = agent.reservoir_model(pred_next_belief)
+            transition_quality_pred = agent.world_model.predict_transition_quality(pred_next_belief)
             policy_logits = torch.nan_to_num(agent.policy(pred_next_belief, z, compute_budget), nan=0.0, posinf=20.0, neginf=-20.0)
             value_pred = torch.nan_to_num(agent.value_head(pred_next_belief, z, compute_budget), nan=0.0, posinf=10.0, neginf=-10.0)
             feedback_context = self._stack_feedback(samples, "feedback_vector", agent.device)
@@ -339,10 +373,20 @@ class OnlineNLRITrainer:
                 dtype=torch.float32,
                 device=agent.device,
             )
+            clean_utility_scores = torch.tensor(
+                [sample.get("clean_utility", sample.get("useful_transition_score", 0.0)) for sample in samples],
+                dtype=torch.float32,
+                device=agent.device,
+            )
             utility_scores = torch.clamp(
                 torch.nan_to_num(utility_scores, nan=0.0),
                 -float(self.config.get("utility_clip", 5.0)),
                 float(self.config.get("utility_clip", 5.0)),
+            )
+            clean_utility_scores = torch.clamp(
+                torch.nan_to_num(clean_utility_scores, nan=0.0),
+                -float(self.config.get("clean_utility_clip", 5.0)),
+                float(self.config.get("clean_utility_clip", 5.0)),
             )
             reservoir_leakage_penalty = leakage_target.mean(dim=1)
             utility_target = torch.clamp(
@@ -355,10 +399,26 @@ class OnlineNLRITrainer:
                 dtype=torch.float32,
                 device=agent.device,
             )
+            value_base = utility_target + float(self.config.get("clean_utility_weight", 0.2)) * clean_utility_scores
             value_target = torch.clamp(
-                utility_target + float(self.config.get("gamma", 0.99)) * done_mask * next_value,
+                value_base + float(self.config.get("gamma", 0.99)) * done_mask * next_value,
                 -float(self.config.get("value_target_clip", 10.0)),
                 float(self.config.get("value_target_clip", 10.0)),
+            )
+            collision_targets = torch.tensor(
+                [1.0 if sample.get("collision") else 0.0 for sample in samples],
+                dtype=torch.float32,
+                device=agent.device,
+            )
+            movement_cost_targets = torch.clamp(
+                torch.tensor([sample.get("movement_cost", 0.0) for sample in samples], dtype=torch.float32, device=agent.device),
+                0.0,
+                5.0,
+            )
+            progress_targets = torch.clamp(
+                torch.tensor([sample.get("progress", 0.0) for sample in samples], dtype=torch.float32, device=agent.device),
+                0.0,
+                1.0,
             )
             self.normalizer.update("reservoir_target", reservoir_next_target.detach().cpu().numpy())
             normalized_reservoir_next_pred = self.normalizer.normalize_tensor("reservoir_target", reservoir_next_pred)
@@ -386,6 +446,7 @@ class OnlineNLRITrainer:
                     normalized_reservoir_star_target,
                     normalized_leakage_target,
                     utility_scores,
+                    clean_utility_scores,
                     value_target,
                     policy_logits,
                     value_pred,
@@ -415,6 +476,7 @@ class OnlineNLRITrainer:
                 fallback_actions=fallback_actions,
                 bc_mask=bc_mask,
                 utility_scores=utility_scores,
+                clean_utility_scores=clean_utility_scores,
                 value_pred=value_pred,
                 value_target=value_target,
                 imagined_actions=imagined_actions,
@@ -427,6 +489,10 @@ class OnlineNLRITrainer:
                 teacher_value=teacher_outputs["value"],
                 teacher_z=teacher_outputs["z"],
                 teacher_compute_budget=teacher_outputs["compute_budget"],
+                transition_quality_pred=transition_quality_pred,
+                collision_targets=collision_targets,
+                movement_cost_targets=movement_cost_targets,
+                progress_targets=progress_targets,
                 world_weight=world_weight,
                 reservoir_weight=reservoir_weight,
                 beta=policy_weight,
@@ -456,6 +522,10 @@ class OnlineNLRITrainer:
                 min_action_prob=float(self.config.get("min_action_prob", 1e-6)),
                 self_distill_weight=float(self.config.get("self_distill_weight", 1.0)),
                 self_distill_temperature=float(self.config.get("self_distill_temperature", 2.0)),
+                collision_loss_weight=float(self.config.get("collision_loss_weight", 0.2)),
+                movement_cost_loss_weight=float(self.config.get("movement_cost_loss_weight", 0.1)),
+                progress_loss_weight=float(self.config.get("progress_loss_weight", 0.1)),
+                clean_utility_weight=float(self.config.get("clean_utility_weight", 0.2)),
             )
 
             total_loss = losses["loss"]
@@ -529,10 +599,10 @@ class OnlineNLRITrainer:
             return False
         state = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         for agent, agent_state in zip(self.agents, state.get("agents", [])):
-            agent.load_state_dict(agent_state)
+            self._load_compatible_state(agent, agent_state)
         teacher_states = state.get("teacher_agents", state.get("agents", []))
         for teacher, teacher_state in zip(self.teacher_agents, teacher_states):
-            teacher.load_state_dict(teacher_state)
+            self._load_compatible_state(teacher, teacher_state)
         optimizer_states = state.get("optimizers", [])
         if not self.eval_mode:
             for optimizer, optimizer_state in zip(self.optimizers, optimizer_states):
@@ -561,6 +631,7 @@ class OnlineNLRITrainer:
         self.fallback_windows = [deque(maxlen=100) for _ in self.agents]
         self.leakage_windows = [deque(maxlen=100) for _ in self.agents]
         self.movement_cost_windows = [deque(maxlen=100) for _ in self.agents]
+        self.collision_windows = [deque(maxlen=100) for _ in self.agents]
         self.utility_windows = [deque(maxlen=100) for _ in self.agents]
         self.learned_action_windows = [deque(maxlen=100) for _ in self.agents]
         self.position_windows = [deque(maxlen=100) for _ in self.agents]
@@ -624,7 +695,12 @@ class OnlineNLRITrainer:
             value = sample.get(key)
             if value is None:
                 value = np.zeros(self.feedback_builder.dim, dtype=np.float32)
-            rows.append(np.asarray(value, dtype=np.float32))
+            arr = np.asarray(value, dtype=np.float32).reshape(-1)
+            if arr.size < self.feedback_builder.dim:
+                arr = np.pad(arr, (0, self.feedback_builder.dim - arr.size))
+            elif arr.size > self.feedback_builder.dim:
+                arr = arr[: self.feedback_builder.dim]
+            rows.append(arr)
         array = np.nan_to_num(np.stack(rows, axis=0), nan=0.0, posinf=1.0, neginf=-1.0)
         return torch.tensor(array, dtype=torch.float32, device=device)
 
@@ -757,6 +833,15 @@ class OnlineNLRITrainer:
     def _finite_parameters(self, agent):
         return all(torch.isfinite(param).all().item() for param in agent.parameters())
 
+    def _load_compatible_state(self, module, state):
+        current = module.state_dict()
+        compatible = {
+            key: value
+            for key, value in state.items()
+            if key in current and tuple(current[key].shape) == tuple(value.shape)
+        }
+        module.load_state_dict(compatible, strict=False)
+
     def _save_last_safe(self, agent_id):
         path = self._last_safe_path(agent_id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -829,6 +914,22 @@ class OnlineNLRITrainer:
             return 1.0
         return float(len(set(positions)) / len(positions))
 
+    def _local_loop_score(self, positions):
+        if not positions:
+            return 0.0
+        return float(1.0 - len(set(positions)) / len(positions))
+
+    def _clean_utility(self, food_delta, energy_delta, collision_count, movement_cost, position_novelty):
+        target = (
+            float(food_delta)
+            + 0.2 * (float(energy_delta) / 1000.0)
+            - 0.5 * float(collision_count)
+            - 0.1 * float(movement_cost)
+            + 0.1 * float(position_novelty)
+        )
+        clip = float(self.config.get("clean_utility_clip", 5.0))
+        return float(np.clip(target, -clip, clip))
+
     def _entropy(self, probs):
         if probs is None:
             return 0.0
@@ -873,12 +974,25 @@ class OnlineNLRITrainer:
             "repeated_same_action_count": 0,
             "compute_target": 0.0,
             "distill_loss": None,
+            "collision_bce_loss": None,
+            "movement_cost_huber_loss": None,
+            "progress_huber_loss": None,
+            "clean_utility_aux_loss": None,
             "teacher_entropy": 0.0,
             "student_entropy": 0.0,
             "teacher_student_kl": 0.0,
             "feedback_score": 0.0,
             "demo_memory_size": 0,
             "demo_score_mean": 0.0,
+            "food_per_collision": 0.0,
+            "food_per_100_steps": 0.0,
+            "collisions_per_100_steps": 0.0,
+            "movement_cost_per_food": 0.0,
+            "useful_score_per_100_steps": 0.0,
+            "energy_slope": 0.0,
+            "local_loop_score": 0.0,
+            "wall_contact_rate": 0.0,
+            "clean_utility": 0.0,
             "raw_total_loss": None,
             "guard_update_skipped": False,
             "nonfinite_update_skipped": False,
@@ -893,3 +1007,7 @@ class OnlineNLRITrainer:
             "uncertainty_sum": 0.0,
             "useful_transition_sum": 0.0,
         }
+
+
+def live_food_ratio(food, collisions):
+    return float(food) / max(1.0, float(collisions))

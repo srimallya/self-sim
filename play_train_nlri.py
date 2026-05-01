@@ -65,6 +65,19 @@ CSV_COLUMNS = [
     "demo_memory_size",
     "feedback_score",
     "demo_score_mean",
+    "food_per_collision",
+    "food_per_100_steps",
+    "collisions_per_100_steps",
+    "movement_cost_per_food",
+    "useful_score_per_100_steps",
+    "energy_slope",
+    "local_loop_score",
+    "wall_contact_rate",
+    "clean_utility",
+    "collision_bce_loss",
+    "movement_cost_huber_loss",
+    "progress_huber_loss",
+    "clean_utility_aux_loss",
     "skipped_updates",
     "nan_recoveries",
     "useful_transition_score",
@@ -98,6 +111,8 @@ def build_parser():
     parser.add_argument("--fallback-decay", type=float, default=0.0002)
     parser.add_argument("--min-fallback-prob", type=float, default=0.25)
     parser.add_argument("--force-no-fallback", action="store_true")
+    parser.add_argument("--eval-fallback-prob", type=float, default=0.0)
+    parser.add_argument("--eval-use-training-fallback-schedule", action="store_true")
     parser.add_argument("--ablation", choices=sorted(ABLATIONS), default="full")
     parser.add_argument("--run-dir", type=str, default="")
     parser.add_argument("--checkpoint-path", type=str, default="")
@@ -156,6 +171,14 @@ def build_parser():
     parser.add_argument("--demo-memory-size", type=int, default=128)
     parser.add_argument("--demo-min-score", type=float, default=0.0)
     parser.add_argument("--actor-critic-weight", type=float, default=0.1)
+    parser.add_argument("--collision-loss-weight", type=float, default=0.05)
+    parser.add_argument("--movement-cost-loss-weight", type=float, default=0.03)
+    parser.add_argument("--progress-loss-weight", type=float, default=0.03)
+    parser.add_argument("--clean-utility-weight", type=float, default=0.05)
+    parser.add_argument("--clean-utility-clip", type=float, default=5.0)
+    parser.add_argument("--demo-collision-weight", type=float, default=0.25)
+    parser.add_argument("--demo-movement-weight", type=float, default=0.05)
+    parser.add_argument("--demo-novelty-weight", type=float, default=0.1)
     return parser
 
 
@@ -179,6 +202,8 @@ def fallback_probability(step: int, args):
         return 0.0
     if args.ablation == "legacy-fallback-only":
         return 1.0
+    if args.eval and not args.eval_use_training_fallback_schedule:
+        return max(0.0, min(1.0, float(args.eval_fallback_prob)))
     if step < args.warmup_steps:
         return 1.0
     decay_steps = max(0, step - args.warmup_steps)
@@ -293,6 +318,14 @@ def run_session(args):
             "demo_memory_size": args.demo_memory_size,
             "demo_min_score": args.demo_min_score,
             "actor_critic_weight": args.actor_critic_weight,
+            "collision_loss_weight": args.collision_loss_weight,
+            "movement_cost_loss_weight": args.movement_cost_loss_weight,
+            "progress_loss_weight": args.progress_loss_weight,
+            "clean_utility_weight": args.clean_utility_weight,
+            "clean_utility_clip": args.clean_utility_clip,
+            "demo_collision_weight": args.demo_collision_weight,
+            "demo_movement_weight": args.demo_movement_weight,
+            "demo_novelty_weight": args.demo_novelty_weight,
         },
     )
     latent_collector = LatentDiagnosticsCollector()
@@ -499,6 +532,19 @@ def snapshot_metrics_rows(step, trainer_metrics, args):
                 "demo_memory_size": int(metrics_row.get("demo_memory_size") or 0),
                 "feedback_score": float(metrics_row.get("feedback_score") or 0.0),
                 "demo_score_mean": float(metrics_row.get("demo_score_mean") or 0.0),
+                "food_per_collision": float(metrics_row.get("food_per_collision") or 0.0),
+                "food_per_100_steps": float(metrics_row.get("food_per_100_steps") or 0.0),
+                "collisions_per_100_steps": float(metrics_row.get("collisions_per_100_steps") or 0.0),
+                "movement_cost_per_food": float(metrics_row.get("movement_cost_per_food") or 0.0),
+                "useful_score_per_100_steps": float(metrics_row.get("useful_score_per_100_steps") or 0.0),
+                "energy_slope": float(metrics_row.get("energy_slope") or 0.0),
+                "local_loop_score": float(metrics_row.get("local_loop_score") or 0.0),
+                "wall_contact_rate": float(metrics_row.get("wall_contact_rate") or 0.0),
+                "clean_utility": float(metrics_row.get("clean_utility") or 0.0),
+                "collision_bce_loss": metrics_row.get("collision_bce_loss"),
+                "movement_cost_huber_loss": metrics_row.get("movement_cost_huber_loss"),
+                "progress_huber_loss": metrics_row.get("progress_huber_loss"),
+                "clean_utility_aux_loss": metrics_row.get("clean_utility_aux_loss"),
                 "skipped_updates": int(metrics_row.get("skipped_updates") or 0),
                 "nan_recoveries": int(metrics_row.get("nan_recoveries") or 0),
                 "useful_transition_score": float(metrics_row["useful_transition_score"]),
@@ -547,6 +593,13 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
     mean_useful_transition_score = safe_mean([row["useful_transition_sum"] / max(1, row["energy_count"]) for row in per_agent])
     mean_hist_max = safe_mean([row["action_histogram_max_fraction"] for row in per_agent])
     mean_position_novelty = safe_mean([row["position_novelty"] for row in per_agent])
+    mean_food_per_collision = safe_mean([row.get("food_per_collision", 0.0) for row in per_agent])
+    mean_food_per_100 = safe_mean([row.get("food_per_100_steps", 0.0) for row in per_agent])
+    mean_collisions_per_100 = safe_mean([row.get("collisions_per_100_steps", 0.0) for row in per_agent])
+    mean_movement_cost_per_food = safe_mean([row.get("movement_cost_per_food", 0.0) for row in per_agent])
+    mean_useful_score_per_100 = safe_mean([row.get("useful_score_per_100_steps", 0.0) for row in per_agent])
+    mean_local_loop_score = safe_mean([row.get("local_loop_score", 0.0) for row in per_agent])
+    mean_wall_contact_rate = safe_mean([row.get("wall_contact_rate", 0.0) for row in per_agent])
     max_steps_since_food = int(max([row["steps_since_food"] for row in per_agent] or [0]))
     losses = [row.get("loss") for row in per_agent if row.get("loss") is not None]
     value_losses = [row.get("value_loss") for row in per_agent if row.get("value_loss") is not None]
@@ -565,6 +618,13 @@ def build_final_summary(trainer_metrics, latent_summary, checkpoint_path, loaded
         "mean_useful_transition_score": mean_useful_transition_score,
         "mean_action_histogram_max_fraction": mean_hist_max,
         "mean_position_novelty": mean_position_novelty,
+        "mean_food_per_collision": mean_food_per_collision,
+        "mean_food_per_100_steps": mean_food_per_100,
+        "mean_collisions_per_100_steps": mean_collisions_per_100,
+        "mean_movement_cost_per_food": mean_movement_cost_per_food,
+        "mean_useful_score_per_100_steps": mean_useful_score_per_100,
+        "mean_local_loop_score": mean_local_loop_score,
+        "mean_wall_contact_rate": mean_wall_contact_rate,
         "max_steps_since_food": max_steps_since_food,
         "final_total_loss": safe_mean(losses),
         "value_loss": safe_mean(value_losses),
@@ -611,6 +671,10 @@ def write_metrics_csv(path, rows):
                 "teacher_entropy",
                 "student_entropy",
                 "teacher_student_kl",
+                "collision_bce_loss",
+                "movement_cost_huber_loss",
+                "progress_huber_loss",
+                "clean_utility_aux_loss",
                 "raw_total_loss",
                 "total_loss",
             ):

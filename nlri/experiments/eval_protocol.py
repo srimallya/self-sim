@@ -16,8 +16,17 @@ CONDITIONS = [
         "ablation": "full",
         "resume": True,
         "force_no_fallback": False,
-        "fallback_prob": 1.0,
-        "min_fallback_prob": 0.25,
+        "fallback_prob": 0.0,
+        "min_fallback_prob": 0.0,
+        "self_distill_weight": 1.0,
+    },
+    {
+        "name": "full-with-fallback",
+        "ablation": "full",
+        "resume": True,
+        "force_no_fallback": False,
+        "fallback_prob": 0.25,
+        "min_fallback_prob": 0.0,
         "self_distill_weight": 1.0,
     },
     {
@@ -89,6 +98,13 @@ PER_SEED_COLUMNS = [
     "mean_entropy",
     "fallback_rate",
     "position_novelty",
+    "food_per_collision",
+    "food_per_100_steps",
+    "collisions_per_100_steps",
+    "movement_cost_per_food",
+    "useful_score_per_100_steps",
+    "local_loop_score",
+    "wall_contact_rate",
     "stagnation_events",
     "survived",
     "no_nan",
@@ -108,6 +124,13 @@ SUMMARY_COLUMNS = [
     "mean_entropy",
     "fallback_rate",
     "position_novelty",
+    "food_per_collision",
+    "food_per_100_steps",
+    "collisions_per_100_steps",
+    "movement_cost_per_food",
+    "useful_score_per_100_steps",
+    "local_loop_score",
+    "wall_contact_rate",
     "stagnation_events",
     "survival_rate",
     "no_nan_rate",
@@ -124,6 +147,9 @@ def parse_args():
     parser.add_argument("--dummy-sdl", action="store_true")
     parser.add_argument("--run-dir", type=str, default="")
     parser.add_argument("--stagnation-threshold", type=int, default=500)
+    parser.add_argument("--eval-fallback-prob", type=float, default=0.0)
+    parser.add_argument("--eval-use-training-fallback-schedule", action="store_true")
+    parser.add_argument("--eval-temperature", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -155,7 +181,10 @@ def main():
                     "checkpoint_path": args.checkpoint,
                     "checkpoint_dir": str(Path(args.checkpoint).parent),
                     "force_no_fallback": condition["force_no_fallback"],
-                    "fallback_prob": condition["fallback_prob"],
+                    "fallback_prob": args.eval_fallback_prob if condition["fallback_prob"] is None else condition["fallback_prob"],
+                    "eval_fallback_prob": args.eval_fallback_prob if condition["fallback_prob"] is None else condition["fallback_prob"],
+                    "eval_use_training_fallback_schedule": args.eval_use_training_fallback_schedule,
+                    "eval_temperature": args.eval_temperature,
                     "fallback_decay": 0.0,
                     "min_fallback_prob": condition["min_fallback_prob"],
                     "ablation": condition["ablation"],
@@ -192,6 +221,13 @@ def row_from_summary(condition, seed, steps, result, stagnation_threshold):
         "mean_entropy": float(summary.get("mean_action_entropy", 0.0)),
         "fallback_rate": float(summary.get("mean_fallback_rate", 0.0)),
         "position_novelty": float(summary.get("mean_position_novelty", 0.0)),
+        "food_per_collision": float(summary.get("mean_food_per_collision", 0.0)),
+        "food_per_100_steps": float(summary.get("mean_food_per_100_steps", 0.0)),
+        "collisions_per_100_steps": float(summary.get("mean_collisions_per_100_steps", 0.0)),
+        "movement_cost_per_food": float(summary.get("mean_movement_cost_per_food", 0.0)),
+        "useful_score_per_100_steps": float(summary.get("mean_useful_score_per_100_steps", 0.0)),
+        "local_loop_score": float(summary.get("mean_local_loop_score", 0.0)),
+        "wall_contact_rate": float(summary.get("mean_wall_contact_rate", 0.0)),
         "stagnation_events": int(stagnation_events),
         "survived": bool(final_energy > 0.0),
         "no_nan": bool(no_nan),
@@ -218,6 +254,13 @@ def summarize(rows, steps):
                 "mean_entropy": mean(items, "mean_entropy"),
                 "fallback_rate": mean(items, "fallback_rate"),
                 "position_novelty": mean(items, "position_novelty"),
+                "food_per_collision": mean(items, "food_per_collision"),
+                "food_per_100_steps": mean(items, "food_per_100_steps"),
+                "collisions_per_100_steps": mean(items, "collisions_per_100_steps"),
+                "movement_cost_per_food": mean(items, "movement_cost_per_food"),
+                "useful_score_per_100_steps": mean(items, "useful_score_per_100_steps"),
+                "local_loop_score": mean(items, "local_loop_score"),
+                "wall_contact_rate": mean(items, "wall_contact_rate"),
                 "stagnation_events": int(sum(item["stagnation_events"] for item in items)),
                 "survival_rate": mean_bool(items, "survived"),
                 "no_nan_rate": mean_bool(items, "no_nan"),
@@ -238,13 +281,15 @@ def rank_key(row):
 def print_ranked_table(rows):
     print(
         f"{'rank':>4} {'condition':<22} {'food':>8} {'survive':>8} {'leakage':>9} "
-        f"{'utility':>9} {'energy':>9} {'entropy':>8} {'fallback':>9} {'nan_ok':>7}"
+        f"{'utility':>9} {'coll/100':>8} {'food/coll':>9} {'energy':>9} "
+        f"{'entropy':>8} {'fallback':>9} {'nan_ok':>7}"
     )
     for index, row in enumerate(rows, start=1):
         print(
             f"{index:>4d} {row['condition']:<22} {row['mean_food_eaten']:>8.2f} "
             f"{row['survival_rate']:>8.2f} {row['mean_leakage']:>9.3f} "
-            f"{row['mean_useful_transition_score']:>9.2f} {row['mean_final_energy']:>9.2f} "
+            f"{row['mean_useful_transition_score']:>9.2f} {row['collisions_per_100_steps']:>8.2f} "
+            f"{row['food_per_collision']:>9.3f} {row['mean_final_energy']:>9.2f} "
             f"{row['mean_entropy']:>8.3f} {row['fallback_rate']:>9.2f} {row['no_nan_rate']:>7.2f}"
         )
 

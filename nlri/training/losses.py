@@ -19,6 +19,7 @@ def compute_nlri_loss(
     fallback_actions: torch.Tensor,
     bc_mask: torch.Tensor,
     utility_scores: torch.Tensor,
+    clean_utility_scores: torch.Tensor | None,
     value_pred: torch.Tensor,
     value_target: torch.Tensor,
     imagined_actions: torch.Tensor,
@@ -31,6 +32,10 @@ def compute_nlri_loss(
     teacher_value: torch.Tensor | None = None,
     teacher_z: torch.Tensor | None = None,
     teacher_compute_budget: torch.Tensor | None = None,
+    transition_quality_pred: Dict[str, torch.Tensor] | None = None,
+    collision_targets: torch.Tensor | None = None,
+    movement_cost_targets: torch.Tensor | None = None,
+    progress_targets: torch.Tensor | None = None,
     world_weight: float = 1.0,
     reservoir_weight: float = 1.0,
     alpha: float = 1.0,
@@ -65,6 +70,10 @@ def compute_nlri_loss(
     min_action_prob: float = 1e-6,
     self_distill_weight: float = 1.0,
     self_distill_temperature: float = 2.0,
+    collision_loss_weight: float = 0.2,
+    movement_cost_loss_weight: float = 0.1,
+    progress_loss_weight: float = 0.1,
+    clean_utility_weight: float = 0.2,
 ) -> Dict[str, torch.Tensor]:
     world_prediction_loss = F.smooth_l1_loss(pred_next_belief, target_obs_embedding) + F.smooth_l1_loss(
         pred_obs_embedding, target_obs_embedding
@@ -101,6 +110,10 @@ def compute_nlri_loss(
     policy_loss = torch.clamp(raw_policy_loss, min=-policy_loss_clip, max=policy_loss_clip)
     utility_scores = torch.clamp(utility_scores, -5.0, 5.0)
     utility_aux_loss = -(chosen_log_probs * utility_scores.detach()).mean()
+    clean_utility_aux_loss = torch.zeros((), device=policy_logits.device)
+    if clean_utility_scores is not None:
+        clean_utility_scores = torch.clamp(clean_utility_scores, -5.0, 5.0)
+        clean_utility_aux_loss = -(chosen_log_probs * clean_utility_scores.detach()).mean()
     entropy_gap = torch.relu(torch.as_tensor(entropy_target, device=policy_logits.device) - entropy_bonus)
     entropy_target_loss = entropy_gap.pow(2)
     uniform = torch.full_like(probs, 1.0 / probs.shape[1])
@@ -151,6 +164,27 @@ def compute_nlri_loss(
             teacher_student_kl + value_distill_loss + compute_distill_loss + 0.1 * z_distill_loss,
             max=10.0,
         )
+    collision_bce_loss = torch.zeros((), device=policy_logits.device)
+    movement_cost_huber_loss = torch.zeros((), device=policy_logits.device)
+    progress_huber_loss = torch.zeros((), device=policy_logits.device)
+    if transition_quality_pred is not None:
+        if collision_targets is not None:
+            collision_bce_loss = F.binary_cross_entropy_with_logits(
+                transition_quality_pred["collision_logit"].squeeze(1),
+                collision_targets.detach(),
+            )
+        if movement_cost_targets is not None:
+            movement_cost_huber_loss = F.smooth_l1_loss(
+                transition_quality_pred["movement_cost"].squeeze(1),
+                movement_cost_targets.detach(),
+                beta=value_huber_delta,
+            )
+        if progress_targets is not None:
+            progress_huber_loss = F.smooth_l1_loss(
+                transition_quality_pred["progress"].squeeze(1),
+                progress_targets.detach(),
+                beta=value_huber_delta,
+            )
 
     entropy_contribution = torch.clamp(entropy_weight * entropy_bonus, min=0.0, max=max_entropy_bonus)
     raw_total = (
@@ -171,6 +205,10 @@ def compute_nlri_loss(
         + compute_loss_weight * compute_loss
         + compute_target_weight * compute_target_loss
         + utility_aux_weight * utility_aux_loss
+        + clean_utility_weight * clean_utility_aux_loss
+        + collision_loss_weight * collision_bce_loss
+        + movement_cost_loss_weight * movement_cost_huber_loss
+        + progress_loss_weight * progress_huber_loss
     )
     total = torch.clamp(raw_total, min=-total_loss_clip, max=total_loss_clip)
     return {
@@ -213,4 +251,8 @@ def compute_nlri_loss(
         "compute_target_loss": compute_target_loss,
         "compute_target": compute_target.mean(),
         "utility_aux_loss": utility_aux_loss,
+        "clean_utility_aux_loss": clean_utility_aux_loss,
+        "collision_bce_loss": collision_bce_loss,
+        "movement_cost_huber_loss": movement_cost_huber_loss,
+        "progress_huber_loss": progress_huber_loss,
     }

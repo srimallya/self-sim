@@ -11,6 +11,7 @@ from .latent_router import LatentRouter
 from .policy import PolicyHead, ValueHead
 from .reservoir_model import ReservoirModel
 from .world_model import WorldModel
+from nlri.training.trajectory_feedback import FEEDBACK_KEYS
 
 
 class NLRIAgent(nn.Module):
@@ -34,7 +35,7 @@ class NLRIAgent(nn.Module):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
         self.encoder = NLRIEncoder(latent_dim=belief_dim)
-        self.feedback_encoder = FeedbackEncoder(feedback_dim=10, context_dim=belief_dim)
+        self.feedback_encoder = FeedbackEncoder(feedback_dim=len(FEEDBACK_KEYS), context_dim=belief_dim)
         self.world_model = WorldModel(latent_dim=belief_dim, belief_dim=belief_dim)
         self.reservoir_model = ReservoirModel(belief_dim=belief_dim)
         self.latent_router = LatentRouter(belief_dim=belief_dim, z_dim=z_dim)
