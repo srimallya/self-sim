@@ -263,6 +263,7 @@ class OnlineNLRITrainer:
         live["energy_sum"] += live["energy"]
         live["energy_count"] += 1
         live["leakage_sum"] += leakage_mean
+        live["movement_cost_sum"] += float(movement_cost)
         live["compute_budget_sum"] += live["compute_budget"]
         live["fallback_sum"] += fallback_flag
         live["entropy_sum"] += action_entropy
@@ -682,6 +683,56 @@ class OnlineNLRITrainer:
             for _ in self.agents
         ]
 
+    def fork_agent(
+        self,
+        winner_agent_id: int,
+        loser_agent_id: int,
+        mutation_std: float = 0.005,
+        mutation_prob: float = 0.05,
+        reset_optimizer: bool = False,
+        mutate_policy: bool = True,
+        mutate_router: bool = True,
+        mutate_value: bool = True,
+        mutate_world: bool = False,
+        mutate_reservoir: bool = False,
+        fork_diversity_noise: float = 0.01,
+    ):
+        """Copy a winning lifetime into a losing slot, then add bounded param noise."""
+        if winner_agent_id == loser_agent_id:
+            return False
+        self._save_last_safe(loser_agent_id)
+        winner = self.agents[winner_agent_id]
+        loser = self.agents[loser_agent_id]
+        loser.load_state_dict(copy.deepcopy(winner.state_dict()))
+        self.teacher_agents[loser_agent_id].load_state_dict(copy.deepcopy(self.teacher_agents[winner_agent_id].state_dict()))
+        if reset_optimizer:
+            self.optimizers[loser_agent_id] = torch.optim.Adam(self._optimizer_param_groups(loser))
+        else:
+            try:
+                self.optimizers[loser_agent_id].load_state_dict(copy.deepcopy(self.optimizers[winner_agent_id].state_dict()))
+            except ValueError:
+                self.optimizers[loser_agent_id] = torch.optim.Adam(self._optimizer_param_groups(loser))
+        self.loss_history[loser_agent_id] = copy.deepcopy(self.loss_history[winner_agent_id])
+        self.loss_ema[loser_agent_id] = copy.deepcopy(self.loss_ema[winner_agent_id])
+        if not bool(self.config.get("preserve_demo_memory", False)):
+            self.demo_memory.items.clear()
+        self._mutate_agent(
+            loser,
+            mutation_std=mutation_std,
+            mutation_prob=mutation_prob,
+            mutate_policy=mutate_policy,
+            mutate_router=mutate_router,
+            mutate_value=mutate_value,
+            mutate_world=mutate_world,
+            mutate_reservoir=mutate_reservoir,
+            fork_diversity_noise=fork_diversity_noise,
+        )
+        if not self._finite_parameters(loser):
+            self._recover_last_safe(loser_agent_id)
+            return False
+        self._save_last_safe(loser_agent_id)
+        return True
+
     def metrics(self):
         rows = []
         for agent_id, stats in enumerate(self.live_stats):
@@ -916,6 +967,45 @@ class OnlineNLRITrainer:
             return path
         return path.with_name(f"{path.stem}_agent_{agent_id}{path.suffix}")
 
+    def _mutate_agent(
+        self,
+        agent,
+        mutation_std,
+        mutation_prob,
+        mutate_policy,
+        mutate_router,
+        mutate_value,
+        mutate_world,
+        mutate_reservoir,
+        fork_diversity_noise,
+    ):
+        modules = []
+        if mutate_policy:
+            modules.append(agent.policy)
+        if mutate_router:
+            modules.append(agent.latent_router)
+        if mutate_value:
+            modules.append(agent.value_head)
+        if mutate_world:
+            modules.append(agent.world_model)
+        if mutate_reservoir:
+            modules.append(agent.reservoir_model)
+        std = max(0.0, float(mutation_std) + float(fork_diversity_noise))
+        prob = float(np.clip(mutation_prob, 0.0, 1.0))
+        if std <= 0.0 or prob <= 0.0:
+            return
+        with torch.no_grad():
+            for module in modules:
+                for param in module.parameters():
+                    if not param.requires_grad:
+                        continue
+                    mask = torch.rand_like(param) < prob
+                    if not mask.any():
+                        continue
+                    param.add_(mask * torch.randn_like(param) * std)
+                    param.nan_to_num_(nan=0.0, posinf=5.0, neginf=-5.0)
+                    param.clamp_(-20.0, 20.0)
+
     def _imagined_actions(self, agent_id, agent, belief, z, compute_budget, policy_logits):
         candidates = max(1, int(self.config.get("imagined_candidates", 4)))
         if int(self.config.get("imagined_horizon", 3)) <= 0 or float(self.config.get("imagined_weight", 0.2)) <= 0:
@@ -1094,6 +1184,7 @@ class OnlineNLRITrainer:
             "energy_sum": 0.0,
             "energy_count": 0,
             "leakage_sum": 0.0,
+            "movement_cost_sum": 0.0,
             "compute_budget_sum": 0.0,
             "fallback_sum": 0.0,
             "entropy_sum": 0.0,

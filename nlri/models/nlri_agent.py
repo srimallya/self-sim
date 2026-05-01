@@ -31,6 +31,8 @@ class NLRIAgent(nn.Module):
         self.use_legacy_fallback = use_legacy_fallback
         self.ablation_mode = ablation_mode
         self.compute_floor = 0.0
+        self.temperature_jitter = 0.0
+        self.z_noise = 0.0
         self.obs_normalizer = None
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -68,6 +70,9 @@ class NLRIAgent(nn.Module):
         else:
             z, compute_budget = self.latent_router(next_belief, compute_floor=self.compute_floor)
         z = torch.nan_to_num(z, nan=0.0, posinf=1.0, neginf=-1.0)
+        if float(getattr(self, "z_noise", 0.0)) > 0.0 and self.training:
+            z = z + torch.randn_like(z) * float(self.z_noise)
+            z = torch.nan_to_num(z, nan=0.0, posinf=1.0, neginf=-1.0)
         compute_budget = torch.nan_to_num(
             compute_budget,
             nan=float(self.compute_floor),

@@ -92,6 +92,13 @@ CSV_COLUMNS = [
     "warnings",
 ]
 
+EVOLUTION_SCORE_MODES = {
+    "food_energy_clean",
+    "reservoir",
+    "food_only",
+    "clean_survival",
+}
+
 
 def build_parser():
     parser = argparse.ArgumentParser(description="One-button realtime NLRI training and evaluation.")
@@ -183,6 +190,24 @@ def build_parser():
     parser.add_argument("--fallback-neighbor-mass", type=float, default=0.15)
     parser.add_argument("--checkpoint-eval-steps", type=int, default=0)
     parser.add_argument("--checkpoint-eval-seeds", type=int, default=0)
+    parser.add_argument("--evolutionary-outer-loop", action="store_true")
+    parser.add_argument("--evolution-window", type=int, default=2000)
+    parser.add_argument("--evolution-warmup-windows", type=int, default=1)
+    parser.add_argument("--evolution-score", choices=sorted(EVOLUTION_SCORE_MODES), default="food_energy_clean")
+    parser.add_argument("--evolution-tie-threshold", type=float, default=0.05)
+    parser.add_argument("--mutation-std", type=float, default=0.005)
+    parser.add_argument("--mutation-prob", type=float, default=0.05)
+    parser.add_argument("--fork-reset-optimizer", action="store_true")
+    parser.add_argument("--preserve-demo-memory", action="store_true")
+    parser.add_argument("--lineage-log", action="store_true")
+    parser.add_argument("--mutate-policy", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mutate-router", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mutate-value", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--mutate-world", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mutate-reservoir", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--fork-diversity-noise", type=float, default=0.01)
+    parser.add_argument("--fork-temperature-jitter", type=float, default=0.1)
+    parser.add_argument("--fork-z-noise", type=float, default=0.01)
     parser.add_argument("--collision-loss-weight", type=float, default=0.05)
     parser.add_argument("--movement-cost-loss-weight", type=float, default=0.03)
     parser.add_argument("--progress-loss-weight", type=float, default=0.03)
@@ -223,6 +248,196 @@ def fallback_probability(step: int, args):
     if args.disable_fallback_after > 0 and step >= args.disable_fallback_after:
         fallback_prob = max(0.05, args.min_fallback_prob * 0.5) if not args.eval else 0.0
     return max(0.0, min(1.0, fallback_prob))
+
+
+class EvolutionOuterLoop:
+    def __init__(self, args, run_dir):
+        self.args = args
+        self.run_dir = Path(run_dir)
+        self.enabled = bool(args.evolutionary_outer_loop)
+        self.window = max(1, int(args.evolution_window))
+        self.warmup_windows = max(0, int(args.evolution_warmup_windows))
+        self.tie_threshold = max(0.0, float(args.evolution_tie_threshold))
+        self.lineage_path = self.run_dir / "lineage.jsonl"
+        self.lineages = {}
+        self.last_snapshot = None
+        self.last_event = None
+        self.next_lineage_id = 0
+        self.last_event_step = 0
+
+    def initialize(self, trainer):
+        if not self.enabled:
+            return
+        for agent_id in range(len(trainer.agents)):
+            self.lineages[agent_id] = {
+                "agent_id": agent_id,
+                "lineage_id": self.next_lineage_id,
+                "parent_lineage_id": None,
+                "generation": 0,
+                "fork_step": 0,
+                "mutation_seed": None,
+                "score_at_fork": None,
+            }
+            self.next_lineage_id += 1
+        self.last_snapshot = self._snapshot(trainer.metrics()["per_agent"])
+        self.lineage_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.lineage_path.open("w", encoding="utf-8"):
+            pass
+
+    def maybe_evolve(self, step, trainer):
+        if not self.enabled or step <= 0 or step % self.window != 0:
+            return None
+        current_window = step // self.window
+        current = self._snapshot(trainer.metrics()["per_agent"])
+        previous = self.last_snapshot or current
+        self.last_snapshot = current
+        window_metrics = [
+            self._window_metrics(agent_id, current[agent_id], previous.get(agent_id, {}))
+            for agent_id in sorted(current)
+        ]
+        if current_window <= self.warmup_windows or len(window_metrics) < 2:
+            return None
+        scored = [
+            {**metrics, "score": self._score(metrics)}
+            for metrics in window_metrics
+        ]
+        scored.sort(key=lambda row: row["score"], reverse=True)
+        winner, loser = scored[0], scored[-1]
+        if abs(winner["score"] - loser["score"]) <= self.tie_threshold:
+            self.last_event = {"step": step, "winner_agent": None, "loser_agent": None, "tied": True}
+            return self.last_event
+        mutation_seed = int(np.random.randint(0, 2**31 - 1))
+        forked = trainer.fork_agent(
+            winner_agent_id=int(winner["agent_id"]),
+            loser_agent_id=int(loser["agent_id"]),
+            mutation_std=float(self.args.mutation_std),
+            mutation_prob=float(self.args.mutation_prob),
+            reset_optimizer=bool(self.args.fork_reset_optimizer),
+            mutate_policy=bool(self.args.mutate_policy),
+            mutate_router=bool(self.args.mutate_router),
+            mutate_value=bool(self.args.mutate_value),
+            mutate_world=bool(self.args.mutate_world),
+            mutate_reservoir=bool(self.args.mutate_reservoir),
+            fork_diversity_noise=float(self.args.fork_diversity_noise),
+        )
+        if not forked:
+            return None
+        parent = self.lineages[int(winner["agent_id"])]
+        loser_id = int(loser["agent_id"])
+        self.lineages[loser_id] = {
+            "agent_id": loser_id,
+            "lineage_id": self.next_lineage_id,
+            "parent_lineage_id": parent["lineage_id"],
+            "generation": int(parent["generation"]) + 1,
+            "fork_step": int(step),
+            "mutation_seed": mutation_seed,
+            "score_at_fork": float(winner["score"]),
+        }
+        self.next_lineage_id += 1
+        trainer.agents[loser_id].temperature_jitter = float(np.random.normal(0.0, self.args.fork_temperature_jitter))
+        trainer.agents[loser_id].z_noise = float(self.args.fork_z_noise)
+        self.last_event_step = step
+        event = {
+            "step": int(step),
+            "winner_agent": int(winner["agent_id"]),
+            "loser_agent": loser_id,
+            "winner_score": float(winner["score"]),
+            "loser_score": float(loser["score"]),
+            "score_components": {str(row["agent_id"]): row for row in scored},
+            "winner_lineage": parent,
+            "new_lineage": self.lineages[loser_id],
+            "mutation_std": float(self.args.mutation_std),
+            "mutation_prob": float(self.args.mutation_prob),
+        }
+        self.last_event = event
+        with self.lineage_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        return event
+
+    def overlay_for(self, agent_id):
+        if not self.enabled:
+            return {}
+        lineage = self.lineages.get(agent_id, {})
+        last = self.last_event or {}
+        return {
+            "generation": lineage.get("generation", 0),
+            "lineage_id": lineage.get("lineage_id", agent_id),
+            "window_score": self._score_from_last_snapshot(agent_id),
+            "last_winner": last.get("winner_agent"),
+            "last_loser": last.get("loser_agent"),
+        }
+
+    def _snapshot(self, rows):
+        return {
+            int(agent_id): {
+                "agent_id": int(agent_id),
+                "food_eaten": float(row.get("food_eaten", 0.0)),
+                "energy": float(row.get("energy", 0.0)),
+                "energy_sum": float(row.get("energy_sum", 0.0)),
+                "energy_count": float(row.get("energy_count", 0.0)),
+                "leakage_sum": float(row.get("leakage_sum", 0.0)),
+                "movement_cost_sum": float(row.get("movement_cost_sum", 0.0)),
+                "collision_count": float(row.get("collision_count", 0.0)),
+                "useful_transition_sum": float(row.get("useful_transition_sum", 0.0)),
+                "position_novelty": float(row.get("position_novelty", 1.0)),
+                "local_loop_score": float(row.get("local_loop_score", 0.0)),
+                "steps_since_food": float(row.get("steps_since_food", 0.0)),
+                "entropy_sum": float(row.get("entropy_sum", 0.0)),
+                "compute_budget_sum": float(row.get("compute_budget_sum", 0.0)),
+                "fallback_sum": float(row.get("fallback_sum", 0.0)),
+            }
+            for agent_id, row in enumerate(rows)
+        }
+
+    def _window_metrics(self, agent_id, current, previous):
+        count_delta = max(1.0, current.get("energy_count", 0.0) - previous.get("energy_count", 0.0))
+        energy_delta = current.get("energy", 0.0) - previous.get("energy", current.get("energy", 0.0))
+        return {
+            "agent_id": int(agent_id),
+            "food_delta": current.get("food_eaten", 0.0) - previous.get("food_eaten", 0.0),
+            "energy_delta": energy_delta,
+            "final_energy": current.get("energy", 0.0),
+            "leakage_sum": current.get("leakage_sum", 0.0) - previous.get("leakage_sum", 0.0),
+            "useful_transition_score": (
+                current.get("useful_transition_sum", 0.0) - previous.get("useful_transition_sum", 0.0)
+            ) / count_delta,
+            "collision_count": current.get("collision_count", 0.0) - previous.get("collision_count", 0.0),
+            "movement_cost": current.get("movement_cost_sum", 0.0) - previous.get("movement_cost_sum", 0.0),
+            "position_novelty": current.get("position_novelty", 1.0),
+            "local_loop_score": current.get("local_loop_score", 0.0),
+            "steps_since_food": current.get("steps_since_food", 0.0),
+            "action_entropy": (current.get("entropy_sum", 0.0) - previous.get("entropy_sum", 0.0)) / count_delta,
+            "compute_budget_mean": (
+                current.get("compute_budget_sum", 0.0) - previous.get("compute_budget_sum", 0.0)
+            ) / count_delta,
+            "fallback_rate": (current.get("fallback_sum", 0.0) - previous.get("fallback_sum", 0.0)) / count_delta,
+        }
+
+    def _score(self, metrics):
+        food = np.clip(metrics["food_delta"], -200.0, 200.0)
+        energy = np.clip(metrics["final_energy"], 0.0, 1000.0)
+        collisions = np.clip(metrics["collision_count"], 0.0, 500.0)
+        movement = np.clip(metrics["movement_cost"], 0.0, 500.0)
+        leakage = np.clip(metrics["leakage_sum"], 0.0, 100.0)
+        novelty = np.clip(metrics["position_novelty"], 0.0, 1.0)
+        loop = np.clip(metrics["local_loop_score"], 0.0, 1.0)
+        utility = np.clip(metrics["useful_transition_score"], -10.0, 10.0)
+        if self.args.evolution_score == "reservoir":
+            score = -leakage + utility + 0.01 * energy
+        elif self.args.evolution_score == "food_only":
+            score = food
+        elif self.args.evolution_score == "clean_survival":
+            score = 0.01 * energy - collisions - loop + novelty
+        else:
+            score = food + 0.01 * energy - 0.5 * collisions - 0.1 * movement - leakage + 0.2 * novelty - 0.5 * loop
+        return float(np.clip(score, -1000.0, 1000.0))
+
+    def _score_from_last_snapshot(self, agent_id):
+        if not self.last_snapshot or agent_id not in self.last_snapshot:
+            return 0.0
+        current = self.last_snapshot[agent_id]
+        previous = {key: 0.0 for key in current}
+        return self._score(self._window_metrics(agent_id, current, previous))
 
 
 def build_agents(observations, args):
@@ -336,6 +551,7 @@ def run_session(args):
             "min_hybrid_distill_weight": args.min_hybrid_distill_weight,
             "fallback_target_confidence": args.fallback_target_confidence,
             "fallback_neighbor_mass": args.fallback_neighbor_mass,
+            "preserve_demo_memory": args.preserve_demo_memory,
             "collision_loss_weight": args.collision_loss_weight,
             "movement_cost_loss_weight": args.movement_cost_loss_weight,
             "progress_loss_weight": args.progress_loss_weight,
@@ -347,6 +563,8 @@ def run_session(args):
         },
     )
     latent_collector = LatentDiagnosticsCollector()
+    evolution = EvolutionOuterLoop(args, run_dir)
+    evolution.initialize(trainer)
     metrics_rows = []
     last_saved_checkpoint = ""
     checkpoint_step = 0
@@ -382,12 +600,14 @@ def run_session(args):
             for agent in agents:
                 agent.use_legacy_fallback = args.ablation not in {"random-policy"} and not args.force_no_fallback
             for agent, obs in zip(agents, current_obs):
+                action_temperature = args.eval_temperature if args.eval else args.policy_temperature
+                action_temperature = max(0.05, action_temperature + float(getattr(agent, "temperature_jitter", 0.0)))
                 action, debug = agent.act(
                     obs,
                     deterministic=args.eval and args.deterministic_eval,
                     fallback_probability=fallback_prob,
                     force_no_fallback=args.force_no_fallback and args.ablation != "legacy-fallback-only",
-                    temperature=args.eval_temperature if args.eval else args.policy_temperature,
+                    temperature=action_temperature,
                 )
                 actions.append(action)
                 debug_rows.append(debug)
@@ -431,20 +651,29 @@ def run_session(args):
             trainer_metrics = trainer.metrics()
             env.overlay_stats = []
             for agent_id, (agent_info, agent_metrics) in enumerate(zip(info["agents"], trainer_metrics["per_agent"])):
-                env.overlay_stats.append(
-                    {
-                        "color": agent_info["color"],
-                        "energy": agent_info["energy"],
-                        "leakage": agent_metrics["leakage"],
-                        "compute_budget": agent_metrics["compute_budget"],
-                        "selected_action": agent_metrics["selected_action"],
-                        "fallback_used": agent_metrics["fallback_used"],
-                        "loss": agent_metrics.get("loss"),
-                    }
-                )
+                overlay_row = {
+                    "color": agent_info["color"],
+                    "energy": agent_info["energy"],
+                    "leakage": agent_metrics["leakage"],
+                    "compute_budget": agent_metrics["compute_budget"],
+                    "selected_action": agent_metrics["selected_action"],
+                    "fallback_used": agent_metrics["fallback_used"],
+                    "loss": agent_metrics.get("loss"),
+                }
+                overlay_row.update(evolution.overlay_for(agent_id))
+                env.overlay_stats.append(overlay_row)
 
             step += 1
             observations = next_observations
+
+            event = evolution.maybe_evolve(step, trainer)
+            if event and event.get("winner_agent") is not None and not args.quiet:
+                print(
+                    f"evolution step={step} winner={event['winner_agent']} loser={event['loser_agent']} "
+                    f"score_w={event['winner_score']:.2f} score_l={event['loser_score']:.2f} "
+                    f"forked lineage={event['winner_lineage']['lineage_id']} -> agent={event['loser_agent']} "
+                    f"new_lineage={event['new_lineage']['lineage_id']} mutation_std={event['mutation_std']:.4f}"
+                )
 
             if step % 100 == 0:
                 rows = snapshot_metrics_rows(step, trainer_metrics, args)

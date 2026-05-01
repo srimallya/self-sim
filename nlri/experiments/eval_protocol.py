@@ -164,6 +164,12 @@ def parse_args():
     parser.add_argument("--eval-fallback-prob", type=float, default=0.0)
     parser.add_argument("--eval-use-training-fallback-schedule", action="store_true")
     parser.add_argument("--eval-temperature", type=float, default=1.0)
+    parser.add_argument("--evolutionary-outer-loop", action="store_true")
+    parser.add_argument("--evolution-window", type=int, default=2000)
+    parser.add_argument("--evolution-warmup-windows", type=int, default=1)
+    parser.add_argument("--evolution-score", type=str, default="food_energy_clean")
+    parser.add_argument("--mutation-std", type=float, default=0.005)
+    parser.add_argument("--mutation-prob", type=float, default=0.05)
     return parser.parse_args()
 
 
@@ -199,6 +205,12 @@ def main():
                     "eval_fallback_prob": args.eval_fallback_prob if condition["fallback_prob"] is None else condition["fallback_prob"],
                     "eval_use_training_fallback_schedule": args.eval_use_training_fallback_schedule,
                     "eval_temperature": args.eval_temperature,
+                    "evolutionary_outer_loop": args.evolutionary_outer_loop,
+                    "evolution_window": args.evolution_window,
+                    "evolution_warmup_windows": args.evolution_warmup_windows,
+                    "evolution_score": args.evolution_score,
+                    "mutation_std": args.mutation_std,
+                    "mutation_prob": args.mutation_prob,
                     "fallback_decay": 0.0,
                     "min_fallback_prob": condition["min_fallback_prob"],
                     "ablation": condition["ablation"],

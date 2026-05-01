@@ -113,9 +113,19 @@ class PygameViewer:
             loss = stats.get("loss")
             loss_text = "--" if loss is None else f"{loss:.2f}"
             energy = stats.get("energy", 0.0)
+            evo_text = ""
+            if "lineage_id" in stats:
+                last_winner = stats.get("last_winner")
+                last_loser = stats.get("last_loser")
+                last_text = "--" if last_winner is None else f"{last_winner}>{last_loser}"
+                evo_text = (
+                    f" G:{int(stats.get('generation', 0))} "
+                    f"Lin:{int(stats.get('lineage_id', idx))} "
+                    f"S:{float(stats.get('window_score', 0.0)):.1f} W/L:{last_text}"
+                )
             line = (
                 f"A{idx} E:{energy:6.1f} L:{leakage:0.03f} "
-                f"B:{compute_budget:0.02f} Act:{action:02d} FB:{fallback_used} Loss:{loss_text}"
+                f"B:{compute_budget:0.02f} Act:{action:02d} FB:{fallback_used} Loss:{loss_text}{evo_text}"
             )
             text = self.font.render(line, True, pygame.Color(stats.get("color", "white")))
             self.screen.blit(text, (12, 28 + 18 * idx))
