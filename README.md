@@ -111,9 +111,7 @@ The proposed cognitive AI architecture offers a promising bridge between artific
 
 ## NLRI Implementation
 
-The original self-sim realtime pygame simulator is preserved in `legacy/Simulator_v25.py` and `legacy/Inference_v25.py`. The top-level `Simulator.py` and `Inference.py` entry points remain runnable and now delegate through compatibility wrappers so the legacy visual loop is still accessible even on machines without the original TensorFlow stack.
-
-The new `nlri/` package keeps the simulator itself as the generative world rather than replacing it with a notebook-only or headless-only experiment. `nlri/envs/maze_reservoir_env.py` preserves the same maze, grid scale, food-dot replenishment, moving agents, heading arrows, and realtime stepping, then exposes those mechanics through a gym-like API:
+The **NLRI** (`nlri/`) package is the main runtime and training system. It keeps the simulator itself as the generative world: `nlri/envs/maze_reservoir_env.py` exposes the same maze, grid scale, food-dot replenishment, moving agents, heading arrows, and realtime stepping through a gym-like API:
 
 ```python
 env = MazeReservoirEnv(render_mode="human")
@@ -136,15 +134,9 @@ It also computes `reservoir_next`, a heuristic `reservoir_star`, and `leakage = 
 
 The model stack in `nlri/models/` uses a learned encoder, world model, reservoir model, latent router, and policy head. The latent router produces a continuous latent `z` and a compute-budget scalar. There are no hand-coded semantic modes such as `search_food` or `act_now`; the only hard constraints kept are movement safety and a cold-start fallback for liveness.
 
-For immediate usability, the NLRI runtime supports a hybrid cold-start policy. The neural policy always produces logits, but when it is still effectively untrained it can fall back to the old energy-gradient taxis behind `use_legacy_fallback=True`. That keeps the pygame loop visibly alive from the first run instead of making visual behavior depend on completed training.
+For immediate usability, the NLRI runtime supports a hybrid cold-start policy. The neural policy always produces logits, but when it is still effectively untrained it can fall back to the energy-gradient taxis behind `use_legacy_fallback=True`. That keeps the pygame loop visibly alive from the first run instead of making visual behavior depend on completed training.
 
-Run the preserved legacy path with:
-
-```bash
-python -m nlri.experiments.run_legacy_pygame
-```
-
-Run the new NLRI realtime pygame simulation with:
+Run the NLRI realtime pygame simulation with:
 
 ```bash
 python -m nlri.experiments.run_nlri_pygame
