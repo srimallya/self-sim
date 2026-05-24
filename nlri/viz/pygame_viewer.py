@@ -102,10 +102,15 @@ class PygameViewer:
         self.screen.blit(surface, (6, 6))
 
         step = getattr(self.env, "step_count", 0)
-        title = self.font.render(f"step {step}", True, (220, 220, 220))
+        mode = overlay_stats[0].get("mode") if overlay_stats else None
+        title_text = f"{mode} step {step}" if mode else f"step {step}"
+        title = self.font.render(title_text, True, (220, 220, 220))
         self.screen.blit(title, (12, 10))
 
         for idx, stats in enumerate(overlay_stats):
+            if stats.get("mode") == "DUAL SYSTEM":
+                self._draw_dual_system_overlay_row(idx, stats)
+                continue
             leakage = stats.get("leakage", 0.0)
             compute_budget = stats.get("compute_budget", 0.0)
             action = stats.get("selected_action", -1)
@@ -129,3 +134,19 @@ class PygameViewer:
             )
             text = self.font.render(line, True, pygame.Color(stats.get("color", "white")))
             self.screen.blit(text, (12, 28 + 18 * idx))
+
+    def _draw_dual_system_overlay_row(self, idx, stats):
+        goal_probs = np.asarray(stats.get("slow_goal_probs", []), dtype=np.float32).reshape(-1)
+        if goal_probs.size:
+            top_goal = int(np.argmax(goal_probs[:4]))
+            goal_text = f"G{top_goal}:{float(goal_probs[top_goal]):.2f}"
+        else:
+            goal_text = "--"
+        line = (
+            f"A{idx} E{stats.get('energy', 0.0):.0f} F{int(stats.get('food_eaten', 0))} "
+            f"C{stats.get('collisions_per_100_steps', 0.0):.0f} FB{stats.get('fallback_rate', 0.0):.2f} "
+            f"Err{stats.get('world_error', 0.0):.2f} SE{stats.get('slow_energy_scale', 1.0):.2f} "
+            f"T{int(stats.get('slow_countdown', 0)):02d} {goal_text} A{int(stats.get('selected_action', -1)):02d}"
+        )
+        text = self.font.render(line, True, pygame.Color(stats.get("color", "white")))
+        self.screen.blit(text, (12, 28 + 18 * idx))

@@ -221,6 +221,31 @@ The ranked table compares food, survival, leakage, utility, collisions, entropy,
 - `random-policy`
 - `legacy-fallback-only`
 
+## Dual-system runtime
+
+The dual-system entrypoint keeps the same pygame maze and online learning loop while exposing a cleaner embodied architecture:
+
+- shared root encoder for `z_t`
+- fast System 1 motor/world predictor every frame
+- slow System 2 modulation every `--slow-interval` steps
+- prediction-error summaries feeding the next slow tick
+
+Run it with:
+
+```bash
+python3 play_train_dual_system.py
+python3 play_train_dual_system.py --eval --resume --force-no-fallback
+```
+
+Smoke checks:
+
+```bash
+python3 -m compileall play_train_dual_system.py nlri
+SDL_VIDEODRIVER=dummy python3 play_train_dual_system.py --steps 300 --warmup-steps 20 --train-every 4 --batch-size 16 --checkpoint-dir /tmp/selfsim-dual-smoke
+```
+
+See `DUAL_SYSTEM.md` for details.
+
 ## Diagnostics And Metrics
 
 Every training/eval run exports metrics that are meant to catch self-deception rather than merely prove that pygame still moves pixels.

@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Play Dual System Simulation",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/play_train_dual_system.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--steps",
+        "20000",
+        "--slow-interval",
+        "25",
+        "--checkpoint-every",
+        "2000"
+      ]
+    }
+  ]
+}

@@ -5,6 +5,7 @@ from .nlri_agent import NLRIAgent
 from .policy import PolicyHead, ValueHead
 from .reservoir_model import ReservoirModel
 from .world_model import WorldModel
+from .dual_system import DualSystemAgent, DualSystemOutput, FastOutput, FastSystem, SharedEncoder, SlowOutput, SlowSystem
 
 __all__ = [
     "NLRIEncoder",
@@ -15,4 +16,11 @@ __all__ = [
     "ValueHead",
     "ReservoirModel",
     "WorldModel",
+    "SharedEncoder",
+    "FastSystem",
+    "SlowSystem",
+    "DualSystemAgent",
+    "FastOutput",
+    "SlowOutput",
+    "DualSystemOutput",
 ]
