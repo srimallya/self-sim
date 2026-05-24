@@ -28,3 +28,25 @@ python3 play_train_dual_system.py
 ```
 
 The dummy SDL command should complete without opening pygame.
+
+## Zero-Sum Energy Duel
+
+`play_train_zero_sum.py` runs a separate competitive stress test. It uses the same visual maze and dual-system agents, but food capture transfers energy from the opponent and rewards are centered so each step is zero-sum.
+
+Run:
+
+```bash
+python3 play_train_zero_sum.py
+python3 play_train_zero_sum.py --stress-preset scarce
+python3 play_train_zero_sum.py --stress-preset collapse --steps 20000
+python3 play_train_zero_sum.py --eval --resume --force-no-fallback
+```
+
+Smoke:
+
+```bash
+python3 -m compileall play_train_zero_sum.py nlri
+SDL_VIDEODRIVER=dummy python3 play_train_zero_sum.py --steps 300 --warmup-steps 20 --train-every 4 --batch-size 16 --checkpoint-dir /tmp/selfsim-zero-sum-smoke
+```
+
+Stress metrics include energy gap, capture share, contact steals, lead changes, reward-sum error, fallback rate, and a compact stress score.

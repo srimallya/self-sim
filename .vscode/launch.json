@@ -15,6 +15,23 @@
         "--checkpoint-every",
         "2000"
       ]
+    },
+    {
+      "name": "Play Zero Sum Energy Duel",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/play_train_zero_sum.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--steps",
+        "20000",
+        "--slow-interval",
+        "20",
+        "--checkpoint-every",
+        "2000",
+        "--stress-preset",
+        "scarce"
+      ]
     }
   ]
 }

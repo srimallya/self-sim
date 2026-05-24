@@ -111,6 +111,9 @@ class PygameViewer:
             if stats.get("mode") == "DUAL SYSTEM":
                 self._draw_dual_system_overlay_row(idx, stats)
                 continue
+            if stats.get("mode") == "ZERO SUM":
+                self._draw_zero_sum_overlay_row(idx, stats)
+                continue
             leakage = stats.get("leakage", 0.0)
             compute_budget = stats.get("compute_budget", 0.0)
             action = stats.get("selected_action", -1)
@@ -147,6 +150,18 @@ class PygameViewer:
             f"C{stats.get('collisions_per_100_steps', 0.0):.0f} FB{stats.get('fallback_rate', 0.0):.2f} "
             f"Err{stats.get('world_error', 0.0):.2f} SE{stats.get('slow_energy_scale', 1.0):.2f} "
             f"T{int(stats.get('slow_countdown', 0)):02d} {goal_text} A{int(stats.get('selected_action', -1)):02d}"
+        )
+        text = self.font.render(line, True, pygame.Color(stats.get("color", "white")))
+        self.screen.blit(text, (12, 28 + 18 * idx))
+
+    def _draw_zero_sum_overlay_row(self, idx, stats):
+        line = (
+            f"A{idx} E{stats.get('energy', 0.0):.0f} F{int(stats.get('food_eaten', 0))} "
+            f"Gap{stats.get('energy_gap', 0.0):+.0f} Cap{int(stats.get('captures', 0))} "
+            f"St{int(stats.get('steals', 0))} FB{stats.get('fallback_rate', 0.0):.2f} "
+            f"Err{stats.get('world_error', 0.0):.2f} SE{stats.get('slow_energy_scale', 1.0):.2f} "
+            f"T{int(stats.get('slow_countdown', 0)):02d} LC{int(stats.get('lead_changes', 0))} "
+            f"Rsum{stats.get('reward_sum', 0.0):+.2f}"
         )
         text = self.font.render(line, True, pygame.Color(stats.get("color", "white")))
         self.screen.blit(text, (12, 28 + 18 * idx))

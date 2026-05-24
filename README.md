@@ -246,6 +246,26 @@ SDL_VIDEODRIVER=dummy python3 play_train_dual_system.py --steps 300 --warmup-ste
 
 See `DUAL_SYSTEM.md` for details.
 
+## Zero-sum energy duel
+
+`play_train_zero_sum.py` is a separate competitive experiment for stress-testing the dual-system agents. It keeps the same maze rendering, but makes food a contested transfer: when one agent captures energy, the opponent loses energy, and the per-step rewards are centered to sum to zero.
+
+Run:
+
+```bash
+python3 play_train_zero_sum.py
+python3 play_train_zero_sum.py --stress-preset scarce
+python3 play_train_zero_sum.py --stress-preset collapse --steps 20000
+```
+
+Smoke check:
+
+```bash
+SDL_VIDEODRIVER=dummy python3 play_train_zero_sum.py --steps 300 --warmup-steps 20 --train-every 4 --batch-size 16 --checkpoint-dir /tmp/selfsim-zero-sum-smoke
+```
+
+The stress-test logs energy gap, capture share, contact steals, lead changes, reward-sum error, fallback rate, and a compact stress score under `runs/zero_sum/<timestamp>/`.
+
 ## Diagnostics And Metrics
 
 Every training/eval run exports metrics that are meant to catch self-deception rather than merely prove that pygame still moves pixels.
