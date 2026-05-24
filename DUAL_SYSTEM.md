@@ -19,6 +19,35 @@ python3 play_train_dual_system.py --eval --resume --force-no-fallback
 
 Checkpoints are written to `checkpoints/dual_system/latest.pt`. Run artifacts are written to `runs/dual_system/<timestamp>/`.
 
+## Experiment Commands
+
+Training:
+
+```bash
+python3 play_train_dual_system.py --steps 20000 --slow-interval 25 --checkpoint-every 2000
+```
+
+Evaluation:
+
+```bash
+python3 play_train_dual_system.py --eval --resume --force-no-fallback --steps 3000
+```
+
+Analysis:
+
+```bash
+python3 analyze_dual_system_runs.py --run-dir runs/dual_system --latest 5
+```
+
+Controlled experiment harness:
+
+```bash
+python3 run_dual_system_experiments.py --experiments all --seeds 1 --dummy-sdl
+python3 run_dual_system_experiments.py --experiments longer_dual,faster_slow_loop --seeds 1,2,3 --dummy-sdl
+```
+
+The harness trains each selected experiment, evaluates with fallback enabled, evaluates with fallback disabled, then writes `dual_system_experiment_summary.md` and `dual_system_experiment_summary.csv`.
+
 ## Smoke Tests
 
 ```bash

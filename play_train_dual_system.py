@@ -30,6 +30,8 @@ CSV_COLUMNS = [
     "fallback_rate",
     "world_error",
     "reservoir_error",
+    "mean_world_error_100",
+    "mean_reservoir_error_100",
     "collision_error",
     "energy_delta_error",
     "error_ema",
@@ -39,9 +41,23 @@ CSV_COLUMNS = [
     "slow_energy_scale",
     "slow_compute_budget",
     "slow_goal_entropy",
+    "goal_avoid",
+    "goal_forage",
+    "goal_conserve",
+    "goal_explore",
     "slow_tick",
+    "slow_tick_count",
+    "no_fallback_action_entropy",
+    "policy_vs_fallback_agreement",
     "policy_loss",
     "value_loss",
+    "slow_error_loss",
+    "slow_collision_loss",
+    "slow_energy_loss",
+    "slow_goal_shaping_loss",
+    "pred_future_error",
+    "pred_slow_collision_risk",
+    "pred_slow_energy_delta",
     "entropy",
     "total_loss",
     "warnings",
@@ -61,6 +77,11 @@ def build_parser():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--policy-lr", type=float, default=5e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--slow-aux-weight", type=float, default=1.0)
+    parser.add_argument("--slow-error-weight", type=float, default=0.10)
+    parser.add_argument("--slow-collision-weight", type=float, default=0.10)
+    parser.add_argument("--slow-energy-weight", type=float, default=0.05)
+    parser.add_argument("--slow-goal-shaping-weight", type=float, default=0.02)
     parser.add_argument("--checkpoint-every", type=int, default=2000)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/dual_system")
     parser.add_argument("--checkpoint-path", type=str, default="")
@@ -101,7 +122,11 @@ class OnlineDualSystemTrainer:
         self.live_stats = [self._make_live_stats() for _ in agents]
         self.loss_history = [self._make_loss_history() for _ in agents]
         self.error_windows = [deque(maxlen=100) for _ in agents]
+        self.world_error_windows = [deque(maxlen=100) for _ in agents]
+        self.reservoir_error_windows = [deque(maxlen=100) for _ in agents]
         self.fallback_windows = [deque(maxlen=100) for _ in agents]
+        self.no_fallback_entropy_windows = [deque(maxlen=100) for _ in agents]
+        self.policy_fallback_agreement_windows = [deque(maxlen=100) for _ in agents]
         self.collision_windows = [deque(maxlen=100) for _ in agents]
         self.prev_counters = [{"food_eaten": 0, "collision_count": 0} for _ in agents]
         self.error_ema = [0.0 for _ in agents]
@@ -121,6 +146,7 @@ class OnlineDualSystemTrainer:
         slow_tick: bool,
     ):
         self._update_normalizers(obs, next_obs, agent_info)
+        current_error_ema = float(self.error_ema[agent_id])
         actual_reservoir = self._reservoir_array(agent_info.get("reservoir_next") or {})
         predicted_reservoir = np.asarray(debug.get("pred_reservoir", np.zeros(len(RESERVOIR_KEYS))), dtype=np.float32)
         reservoir_error = float(np.mean(np.abs(predicted_reservoir - actual_reservoir)))
@@ -136,7 +162,10 @@ class OnlineDualSystemTrainer:
         energy_delta_error = abs(float(debug.get("pred_energy_delta", 0.0)) - energy_delta)
         total_error = world_error + reservoir_error + collision_error + 0.05 * energy_delta_error
         self.error_ema[agent_id] = 0.98 * self.error_ema[agent_id] + 0.02 * total_error
+        next_error_ema = float(self.error_ema[agent_id])
         self.error_windows[agent_id].append(total_error)
+        self.world_error_windows[agent_id].append(world_error)
+        self.reservoir_error_windows[agent_id].append(reservoir_error)
         self.fallback_windows[agent_id].append(1.0 if debug.get("fallback_used") else 0.0)
 
         prev = self.prev_counters[agent_id]
@@ -162,11 +191,31 @@ class OnlineDualSystemTrainer:
             energy_delta=float(energy_delta),
             fallback_action=int(debug.get("fallback_action", action)),
             fallback_used=bool(debug.get("fallback_used", False)),
+            current_error_ema=current_error_ema,
+            next_error_ema=next_error_ema,
+            slow_energy_scale=float(debug.get("slow_energy_scale", 1.0)),
+            slow_compute_budget=float(debug.get("slow_compute_budget", 0.5)),
+            goal_avoid=float(_goal_prob(debug.get("slow_goal_probs"), 0)),
+            goal_forage=float(_goal_prob(debug.get("slow_goal_probs"), 1)),
+            goal_conserve=float(_goal_prob(debug.get("slow_goal_probs"), 2)),
+            goal_explore=float(_goal_prob(debug.get("slow_goal_probs"), 3)),
             error_summary=self.error_summary(agent_id),
             history_summary=self.history_summary(agent_id),
         )
 
-        entropy_value = entropy(debug.get("action_probs"))
+        action_probs = np.nan_to_num(
+            np.asarray(debug.get("action_probs", []), dtype=np.float32).reshape(-1),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        entropy_value = entropy(action_probs)
+        no_fallback_action_entropy = entropy_value
+        policy_action = int(np.argmax(action_probs)) if action_probs.size else int(action)
+        fallback_action = int(debug.get("fallback_action", action))
+        policy_vs_fallback_agreement = 1.0 if policy_action == fallback_action else 0.0
+        self.no_fallback_entropy_windows[agent_id].append(no_fallback_action_entropy)
+        self.policy_fallback_agreement_windows[agent_id].append(policy_vs_fallback_agreement)
         goal_probs = np.asarray(debug.get("slow_goal_probs", np.ones(4) / 4.0), dtype=np.float32)
         goal_entropy = entropy(goal_probs)
         live = self.live_stats[agent_id]
@@ -179,6 +228,8 @@ class OnlineDualSystemTrainer:
                 "fallback_rate": float(np.mean(self.fallback_windows[agent_id])) if self.fallback_windows[agent_id] else 0.0,
                 "world_error": world_error,
                 "reservoir_error": reservoir_error,
+                "mean_world_error_100": float(np.mean(self.world_error_windows[agent_id])) if self.world_error_windows[agent_id] else 0.0,
+                "mean_reservoir_error_100": float(np.mean(self.reservoir_error_windows[agent_id])) if self.reservoir_error_windows[agent_id] else 0.0,
                 "collision_error": collision_error,
                 "energy_delta_error": energy_delta_error,
                 "error_ema": float(self.error_ema[agent_id]),
@@ -189,9 +240,15 @@ class OnlineDualSystemTrainer:
                 "slow_compute_budget": float(debug.get("slow_compute_budget", 0.5)),
                 "slow_goal_entropy": goal_entropy,
                 "slow_tick": bool(slow_tick),
+                "slow_tick_count": int(live.get("slow_tick_count", 0)) + (1 if slow_tick else 0),
                 "selected_action": int(debug.get("selected_action", action)),
                 "fallback_used": bool(debug.get("fallback_used", False)),
                 "action_entropy": entropy_value,
+                "no_fallback_action_entropy": float(np.mean(self.no_fallback_entropy_windows[agent_id])),
+                "policy_vs_fallback_agreement": float(np.mean(self.policy_fallback_agreement_windows[agent_id])),
+                "pred_future_error": float(debug.get("pred_future_error", 0.0)),
+                "pred_slow_collision_risk": float(debug.get("pred_slow_collision_risk", 0.0)),
+                "pred_slow_energy_delta": float(debug.get("pred_slow_energy_delta", 0.0)),
                 "slow_goal_probs": goal_probs,
                 "energy_sum": live["energy_sum"] + float(agent_info.get("energy", 0.0)),
                 "count": live["count"] + 1,
@@ -261,6 +318,11 @@ class OnlineDualSystemTrainer:
             movement_target = torch.tensor([[row.get("movement_cost", 0.0)] for row in rows], dtype=torch.float32, device=agent.device).clamp(0.0, 5.0)
             progress_target = torch.tensor([[row.get("progress", 0.0)] for row in rows], dtype=torch.float32, device=agent.device).clamp(0.0, 1.0)
             energy_target = torch.tensor([[row.get("energy_delta", 0.0)] for row in rows], dtype=torch.float32, device=agent.device).clamp(-5.0, 5.0)
+            future_error_target = torch.tensor(
+                [[row.get("next_error_ema", row.get("current_error_ema", 0.0))] for row in rows],
+                dtype=torch.float32,
+                device=agent.device,
+            ).clamp(0.0, 20.0)
 
             log_probs = F.log_softmax(output.final_logits, dim=1)
             probs = torch.exp(log_probs)
@@ -276,6 +338,20 @@ class OnlineDualSystemTrainer:
             movement_loss = F.huber_loss(output.fast.movement_cost, movement_target, delta=1.0)
             progress_loss = F.binary_cross_entropy_with_logits(output.fast.progress_logit, progress_target)
             energy_loss = F.huber_loss(output.fast.energy_delta, energy_target, delta=1.0)
+            slow_error_loss = F.huber_loss(output.slow.pred_future_error, future_error_target, delta=1.0)
+            slow_collision_loss = F.binary_cross_entropy_with_logits(output.slow.pred_collision_risk, collision_target)
+            slow_energy_loss = F.huber_loss(output.slow.pred_energy_delta, energy_target, delta=1.0)
+            slow_goal_shaping_loss = F.kl_div(
+                F.log_softmax(output.slow.goal_logits, dim=1),
+                self._slow_goal_targets(rows, agent.device),
+                reduction="batchmean",
+            )
+            slow_aux_loss = float(self.config.get("slow_aux_weight", 1.0)) * (
+                float(self.config.get("slow_error_weight", 0.10)) * slow_error_loss
+                + float(self.config.get("slow_collision_weight", 0.10)) * slow_collision_loss
+                + float(self.config.get("slow_energy_weight", 0.05)) * slow_energy_loss
+                + float(self.config.get("slow_goal_shaping_weight", 0.02)) * slow_goal_shaping_loss
+            )
             compute_penalty = output.slow.compute_budget.mean() * 0.01
             total_loss = (
                 0.5 * world_loss
@@ -289,6 +365,7 @@ class OnlineDualSystemTrainer:
                 + bc_weight * bc_loss
                 - 0.01 * entropy_bonus
                 + compute_penalty
+                + slow_aux_loss
             )
             if not torch.isfinite(total_loss):
                 continue
@@ -304,6 +381,10 @@ class OnlineDualSystemTrainer:
                 "energy_delta_error": float(energy_loss.detach().cpu().item()),
                 "policy_loss": float(policy_loss.detach().cpu().item()),
                 "value_loss": float(value_loss.detach().cpu().item()),
+                "slow_error_loss": float(slow_error_loss.detach().cpu().item()),
+                "slow_collision_loss": float(slow_collision_loss.detach().cpu().item()),
+                "slow_energy_loss": float(slow_energy_loss.detach().cpu().item()),
+                "slow_goal_shaping_loss": float(slow_goal_shaping_loss.detach().cpu().item()),
                 "entropy": float(entropy_bonus.detach().cpu().item()),
                 "total_loss": float(total_loss.detach().cpu().item()),
             }
@@ -403,7 +484,11 @@ class OnlineDualSystemTrainer:
         self.live_stats = [self._make_live_stats() for _ in self.agents]
         self.loss_history = [self._make_loss_history() for _ in self.agents]
         self.error_windows = [deque(maxlen=100) for _ in self.agents]
+        self.world_error_windows = [deque(maxlen=100) for _ in self.agents]
+        self.reservoir_error_windows = [deque(maxlen=100) for _ in self.agents]
         self.fallback_windows = [deque(maxlen=100) for _ in self.agents]
+        self.no_fallback_entropy_windows = [deque(maxlen=100) for _ in self.agents]
+        self.policy_fallback_agreement_windows = [deque(maxlen=100) for _ in self.agents]
         self.collision_windows = [deque(maxlen=100) for _ in self.agents]
         self.prev_counters = [{"food_eaten": 0, "collision_count": 0} for _ in self.agents]
         self.error_ema = [0.0 for _ in self.agents]
@@ -442,6 +527,8 @@ class OnlineDualSystemTrainer:
             "fallback_rate": 0.0,
             "world_error": 0.0,
             "reservoir_error": 0.0,
+            "mean_world_error_100": 0.0,
+            "mean_reservoir_error_100": 0.0,
             "collision_error": 0.0,
             "energy_delta_error": 0.0,
             "error_ema": 0.0,
@@ -452,9 +539,15 @@ class OnlineDualSystemTrainer:
             "slow_compute_budget": 0.5,
             "slow_goal_entropy": 0.0,
             "slow_tick": False,
+            "slow_tick_count": 0,
             "selected_action": 0,
             "fallback_used": False,
             "action_entropy": 0.0,
+            "no_fallback_action_entropy": 0.0,
+            "policy_vs_fallback_agreement": 0.0,
+            "pred_future_error": 0.0,
+            "pred_slow_collision_risk": 0.0,
+            "pred_slow_energy_delta": 0.0,
             "slow_goal_probs": np.ones(4, dtype=np.float32) / 4.0,
             "energy_sum": 0.0,
             "count": 0,
@@ -465,9 +558,32 @@ class OnlineDualSystemTrainer:
         return {
             "policy_loss": None,
             "value_loss": None,
+            "slow_error_loss": None,
+            "slow_collision_loss": None,
+            "slow_energy_loss": None,
+            "slow_goal_shaping_loss": None,
             "entropy": None,
             "total_loss": None,
         }
+
+    def _slow_goal_targets(self, rows: List[Dict[str, Any]], device):
+        targets = []
+        for row in rows:
+            reservoir = row.get("reservoir") or {}
+            energy = float(np.asarray((row.get("obs") or {}).get("energy", [0.0]), dtype=np.float32).reshape(-1)[0])
+            reachable_food = float((reservoir or {}).get("reachable_food_value", 0.0))
+            visible_food = float((reservoir or {}).get("visible_food_value", 0.0))
+            error = float(row.get("current_error_ema", 0.0))
+            collision = 1.0 if row.get("collision") else 0.0
+            target = np.asarray([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+            target[0] += 1.5 * collision
+            target[1] += 0.8 * max(0.0, 0.45 - energy) + 0.8 * max(reachable_food, visible_food)
+            target[2] += 0.7 * max(0.0, energy - 0.65) * max(0.0, 1.0 - error)
+            target[3] += 0.7 * min(error, 2.0) * max(0.0, 1.0 - max(reachable_food, visible_food))
+            target = np.clip(target, 1e-4, None)
+            target = target / float(target.sum())
+            targets.append(target)
+        return torch.tensor(np.stack(targets, axis=0), dtype=torch.float32, device=device)
 
 
 def run_session(args):
@@ -503,6 +619,11 @@ def run_session(args):
             "grad_clip": args.grad_clip,
             "warmup_steps": args.warmup_steps,
             "eval_mode": args.eval,
+            "slow_aux_weight": args.slow_aux_weight,
+            "slow_error_weight": args.slow_error_weight,
+            "slow_collision_weight": args.slow_collision_weight,
+            "slow_energy_weight": args.slow_energy_weight,
+            "slow_goal_shaping_weight": args.slow_goal_shaping_weight,
         },
     )
     latent_collector = LatentDiagnosticsCollector()
@@ -517,6 +638,7 @@ def run_session(args):
     rows = []
     last_checkpoint = ""
     step = 0
+    survival_steps = None
     try:
         while True:
             if env.viewer is not None and env.viewer.closed:
@@ -593,9 +715,17 @@ def run_session(args):
                         "collisions_per_100_steps": metric_row["collisions_per_100_steps"],
                         "fallback_rate": metric_row["fallback_rate"],
                         "world_error": metric_row["error_ema"],
+                        "mean_world_error_100": metric_row["mean_world_error_100"],
+                        "mean_reservoir_error_100": metric_row["mean_reservoir_error_100"],
                         "slow_energy_scale": metric_row["slow_energy_scale"],
                         "slow_countdown": countdown,
                         "slow_goal_probs": metric_row.get("slow_goal_probs"),
+                        "slow_tick_count": metric_row["slow_tick_count"],
+                        "no_fallback_action_entropy": metric_row["no_fallback_action_entropy"],
+                        "policy_vs_fallback_agreement": metric_row["policy_vs_fallback_agreement"],
+                        "pred_future_error": metric_row["pred_future_error"],
+                        "pred_slow_collision_risk": metric_row["pred_slow_collision_risk"],
+                        "pred_slow_energy_delta": metric_row["pred_slow_energy_delta"],
                         "selected_action": metric_row["selected_action"],
                         "fallback_used": metric_row["fallback_used"],
                         "loss": metric_row.get("total_loss"),
@@ -613,6 +743,8 @@ def run_session(args):
             if not args.eval and step % max(1, args.checkpoint_every) == 0:
                 last_checkpoint = trainer.save_checkpoint(checkpoint_dir, step, periodic=True)[0]
             if done:
+                if survival_steps is None:
+                    survival_steps = step
                 observations, _ = env.reset(seed=args.seed + step)
                 for agent in agents:
                     agent.reset_state()
@@ -626,7 +758,7 @@ def run_session(args):
         last_checkpoint = trainer.save_checkpoint(checkpoint_dir, step, periodic=False)[0]
     write_metrics_csv(metrics_path, rows)
     latent_collector.save(latent_path)
-    summary = build_final_summary(final_metrics, latent_collector.summary(), last_checkpoint, loaded_checkpoint, step)
+    summary = build_final_summary(final_metrics, latent_collector.summary(), last_checkpoint, loaded_checkpoint, step, survival_steps or step)
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
     if not args.quiet:
@@ -667,6 +799,8 @@ def snapshot_rows(step, metrics):
                 "fallback_rate": float(row.get("fallback_rate", 0.0)),
                 "world_error": float(row.get("world_error", 0.0)),
                 "reservoir_error": float(row.get("reservoir_error", 0.0)),
+                "mean_world_error_100": float(row.get("mean_world_error_100", 0.0)),
+                "mean_reservoir_error_100": float(row.get("mean_reservoir_error_100", 0.0)),
                 "collision_error": float(row.get("collision_error", 0.0)),
                 "energy_delta_error": float(row.get("energy_delta_error", 0.0)),
                 "error_ema": float(row.get("error_ema", 0.0)),
@@ -676,9 +810,23 @@ def snapshot_rows(step, metrics):
                 "slow_energy_scale": float(row.get("slow_energy_scale", 1.0)),
                 "slow_compute_budget": float(row.get("slow_compute_budget", 0.0)),
                 "slow_goal_entropy": float(row.get("slow_goal_entropy", 0.0)),
+                "goal_avoid": float(_goal_prob(row.get("slow_goal_probs"), 0)),
+                "goal_forage": float(_goal_prob(row.get("slow_goal_probs"), 1)),
+                "goal_conserve": float(_goal_prob(row.get("slow_goal_probs"), 2)),
+                "goal_explore": float(_goal_prob(row.get("slow_goal_probs"), 3)),
                 "slow_tick": bool(row.get("slow_tick", False)),
+                "slow_tick_count": int(row.get("slow_tick_count", 0)),
+                "no_fallback_action_entropy": float(row.get("no_fallback_action_entropy", 0.0)),
+                "policy_vs_fallback_agreement": float(row.get("policy_vs_fallback_agreement", 0.0)),
+                "pred_future_error": float(row.get("pred_future_error", 0.0)),
+                "pred_slow_collision_risk": float(row.get("pred_slow_collision_risk", 0.0)),
+                "pred_slow_energy_delta": float(row.get("pred_slow_energy_delta", 0.0)),
                 "policy_loss": row.get("policy_loss"),
                 "value_loss": row.get("value_loss"),
+                "slow_error_loss": row.get("slow_error_loss"),
+                "slow_collision_loss": row.get("slow_collision_loss"),
+                "slow_energy_loss": row.get("slow_energy_loss"),
+                "slow_goal_shaping_loss": row.get("slow_goal_shaping_loss"),
                 "entropy": row.get("entropy"),
                 "total_loss": row.get("total_loss"),
                 "warnings": "|".join(row.get("warning_flags", [])),
@@ -692,9 +840,13 @@ def format_metrics(row):
         f"step={row['step']} agent={row['agent_id']} energy={row['energy']:.1f} "
         f"food={row['food_eaten']} coll/100={row['collisions_per_100_steps']:.1f} "
         f"fb={row['fallback_rate']:.2f} err_ema={row['error_ema']:.3f} "
+        f"w100={row['mean_world_error_100']:.3f} r100={row['mean_reservoir_error_100']:.3f} "
         f"z_mean={row['z_mean']:.3f} z_std={row['z_std']:.3f} "
         f"slow_E={row['slow_energy_scale']:.2f} slow_C={row['slow_compute_budget']:.2f} "
-        f"goal_H={row['slow_goal_entropy']:.2f} loss={fmt_loss(row['total_loss'])}"
+        f"slow_ticks={row['slow_tick_count']} nf_H={row['no_fallback_action_entropy']:.2f} "
+        f"pf_agree={row['policy_vs_fallback_agreement']:.2f} goal_H={row['slow_goal_entropy']:.2f} "
+        f"slow_pred_err={row['pred_future_error']:.2f} slow_risk={row['pred_slow_collision_risk']:.2f} "
+        f"loss={fmt_loss(row['total_loss'])}"
     )
 
 
@@ -712,14 +864,27 @@ def write_metrics_csv(path, rows):
             writer.writerow(serialized)
 
 
-def build_final_summary(metrics, latent_summary, checkpoint_path, loaded_checkpoint, step):
+def build_final_summary(metrics, latent_summary, checkpoint_path, loaded_checkpoint, step, survival_steps=None):
     rows = metrics["per_agent"]
     return {
         "steps": int(step),
+        "survival_steps": int(survival_steps if survival_steps is not None else step),
         "mean_energy": safe_mean([row.get("energy_sum", 0.0) / max(1, row.get("count", 0)) for row in rows]),
         "total_food_eaten": int(sum(row.get("food_eaten", 0) for row in rows)),
         "mean_fallback_rate": safe_mean([row.get("fallback_sum", 0.0) / max(1, row.get("count", 0)) for row in rows]),
         "mean_error_ema": safe_mean([row.get("error_ema", 0.0) for row in rows]),
+        "mean_world_error_100": safe_mean([row.get("mean_world_error_100", 0.0) for row in rows]),
+        "mean_reservoir_error_100": safe_mean([row.get("mean_reservoir_error_100", 0.0) for row in rows]),
+        "mean_no_fallback_action_entropy": safe_mean([row.get("no_fallback_action_entropy", 0.0) for row in rows]),
+        "mean_policy_vs_fallback_agreement": safe_mean([row.get("policy_vs_fallback_agreement", 0.0) for row in rows]),
+        "mean_pred_future_error": safe_mean([row.get("pred_future_error", 0.0) for row in rows]),
+        "mean_pred_slow_collision_risk": safe_mean([row.get("pred_slow_collision_risk", 0.0) for row in rows]),
+        "mean_pred_slow_energy_delta": safe_mean([row.get("pred_slow_energy_delta", 0.0) for row in rows]),
+        "mean_slow_error_loss": safe_mean([row.get("slow_error_loss") for row in rows]),
+        "mean_slow_collision_loss": safe_mean([row.get("slow_collision_loss") for row in rows]),
+        "mean_slow_energy_loss": safe_mean([row.get("slow_energy_loss") for row in rows]),
+        "mean_slow_goal_shaping_loss": safe_mean([row.get("slow_goal_shaping_loss") for row in rows]),
+        "total_slow_tick_count": int(sum(row.get("slow_tick_count", 0) for row in rows)),
         "mean_collisions_per_100_steps": safe_mean([row.get("collisions_per_100_steps", 0.0) for row in rows]),
         "checkpoint_path": checkpoint_path or "",
         "loaded_checkpoint": loaded_checkpoint or "",
@@ -740,6 +905,13 @@ def entropy(probs):
 
 def np_mean_dict(values):
     return 0.0 if not values else float(np.mean(list(values.values())))
+
+
+def _goal_prob(values, idx):
+    array = np.asarray(values if values is not None else [], dtype=np.float32).reshape(-1)
+    if idx >= array.size:
+        return 0.0
+    return float(np.nan_to_num(array[idx], nan=0.0, posinf=0.0, neginf=0.0))
 
 
 def safe_mean(values):

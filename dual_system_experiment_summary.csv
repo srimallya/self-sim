@@ -1,0 +1,4 @@
+experiment,seed,status,train_final_fallback_rate,train_final_error_ema,train_final_mean_world_error_100,train_final_mean_reservoir_error_100,train_final_slow_goal_entropy,eval_fallback_total_food_eaten,eval_no_fallback_total_food_eaten,eval_no_fallback_mean_energy,eval_no_fallback_survival_steps,eval_no_fallback_action_entropy,policy_vs_fallback_agreement,no_fallback_viability_score,food_score,energy_score,entropy_score,collision_penalty,failures
+faster_slow_loop,1,ok,0.040000,2.659859,2.071560,0.084725,1.202448,91,767,826.506783,1403,1.208647,0.185000,2.162481,1.000000,0.826507,0.750974,0.415000,
+faster_slow_aux,1,ok,0.020000,2.613974,1.976407,0.089227,1.270989,63,703,780.192033,1660,0.808354,0.155000,1.782451,1.000000,0.780192,0.502258,0.500000,
+faster_slow_aux_stronger_collision,1,ok,0.055000,2.485840,2.054759,0.096262,1.247870,91,961,864.370800,3000,0.695218,0.305000,2.081334,1.000000,0.864371,0.431963,0.215000,

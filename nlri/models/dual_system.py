@@ -41,6 +41,9 @@ class SlowOutput:
     action_bias: torch.Tensor
     goal_logits: torch.Tensor
     next_thought: torch.Tensor
+    pred_future_error: torch.Tensor
+    pred_collision_risk: torch.Tensor
+    pred_energy_delta: torch.Tensor
 
 
 @dataclass
@@ -144,6 +147,9 @@ class SlowSystem(nn.Module):
         self.bias_head = nn.Linear(128, action_dim)
         self.goal_head = nn.Linear(128, goal_dim)
         self.thought_head = nn.Linear(128, thought_dim)
+        self.future_error_head = nn.Linear(128, 1)
+        self.collision_risk_head = nn.Linear(128, 1)
+        self.energy_delta_head = nn.Linear(128, 1)
 
     def forward(
         self,
@@ -162,6 +168,9 @@ class SlowSystem(nn.Module):
             action_bias=torch.tanh(self.bias_head(hidden)) * 1.5,
             goal_logits=torch.nan_to_num(self.goal_head(hidden), nan=0.0).clamp(-20.0, 20.0),
             next_thought=torch.tanh(self.thought_head(hidden)),
+            pred_future_error=torch.nn.functional.softplus(self.future_error_head(hidden)).clamp(0.0, 20.0),
+            pred_collision_risk=torch.nan_to_num(self.collision_risk_head(hidden), nan=0.0).clamp(-20.0, 20.0),
+            pred_energy_delta=torch.nan_to_num(self.energy_delta_head(hidden), nan=0.0).clamp(-5.0, 5.0),
         )
 
 
@@ -191,6 +200,9 @@ class DualSystemAgent(nn.Module):
         self.register_buffer("last_action_bias", torch.zeros(1, action_dim))
         self.register_buffer("last_goal_logits", torch.zeros(1, 4))
         self.register_buffer("last_thought", torch.zeros(1, 32))
+        self.register_buffer("last_pred_future_error", torch.zeros(1, 1))
+        self.register_buffer("last_pred_collision_risk", torch.zeros(1, 1))
+        self.register_buffer("last_pred_energy_delta", torch.zeros(1, 1))
         self.last_debug: Dict[str, object] = {}
         self.to(self.device)
 
@@ -201,6 +213,9 @@ class DualSystemAgent(nn.Module):
         self.last_action_bias = torch.zeros(batch_size, self.action_dim, device=self.device)
         self.last_goal_logits = torch.zeros(batch_size, 4, device=self.device)
         self.last_thought = torch.zeros(batch_size, 32, device=self.device)
+        self.last_pred_future_error = torch.zeros(batch_size, 1, device=self.device)
+        self.last_pred_collision_risk = torch.zeros(batch_size, 1, device=self.device)
+        self.last_pred_energy_delta = torch.zeros(batch_size, 1, device=self.device)
 
     def forward_tensors(
         self,
@@ -232,6 +247,9 @@ class DualSystemAgent(nn.Module):
                         action_bias=slow.action_bias.detach(),
                         goal_logits=slow.goal_logits.detach(),
                         next_thought=slow.next_thought.detach(),
+                        pred_future_error=slow.pred_future_error.detach(),
+                        pred_collision_risk=slow.pred_collision_risk.detach(),
+                        pred_energy_delta=slow.pred_energy_delta.detach(),
                     )
                 self.last_modulation = stored.modulation
                 self.last_energy_scale = stored.energy_scale
@@ -239,6 +257,9 @@ class DualSystemAgent(nn.Module):
                 self.last_action_bias = stored.action_bias
                 self.last_goal_logits = stored.goal_logits
                 self.last_thought = stored.next_thought
+                self.last_pred_future_error = stored.pred_future_error
+                self.last_pred_collision_risk = stored.pred_collision_risk
+                self.last_pred_energy_delta = stored.pred_energy_delta
         else:
             slow = SlowOutput(
                 modulation=self._expand(self.last_modulation, batch_size),
@@ -247,6 +268,9 @@ class DualSystemAgent(nn.Module):
                 action_bias=self._expand(self.last_action_bias, batch_size),
                 goal_logits=self._expand(self.last_goal_logits, batch_size),
                 next_thought=self._expand(self.last_thought, batch_size),
+                pred_future_error=self._expand(self.last_pred_future_error, batch_size),
+                pred_collision_risk=self._expand(self.last_pred_collision_risk, batch_size),
+                pred_energy_delta=self._expand(self.last_pred_energy_delta, batch_size),
             )
 
         prev_action = self._last_action_onehot(obs_t["last_action"])
@@ -326,6 +350,10 @@ class DualSystemAgent(nn.Module):
             "slow_compute_budget": float(output.slow.compute_budget[0, 0].detach().cpu().item()),
             "slow_goal_logits": output.slow.goal_logits[0].detach().cpu().numpy(),
             "slow_goal_probs": goal_probs.detach().cpu().numpy(),
+            "pred_future_error": float(output.slow.pred_future_error[0, 0].detach().cpu().item()),
+            "pred_slow_collision_risk": float(torch.sigmoid(output.slow.pred_collision_risk[0, 0]).detach().cpu().item()),
+            "pred_slow_collision_logit": float(output.slow.pred_collision_risk[0, 0].detach().cpu().item()),
+            "pred_slow_energy_delta": float(output.slow.pred_energy_delta[0, 0].detach().cpu().item()),
             "value": float(output.value[0, 0].detach().cpu().item()),
             "pred_next_z": output.fast.pred_next_z[0].detach().cpu().numpy(),
             "pred_reservoir": output.fast.pred_reservoir[0].detach().cpu().numpy(),
